@@ -4,8 +4,8 @@ Changes to the patch server (`lmoxide-patch-server`) and the patcher library (`l
 in the [lmoxide](https://github.com/LMOxide/lmoxide) repo that this GUI would benefit from.
 Found while building the first version (2026-10-24).
 
-**Status:** items 1, 2, 4, 5 and 6 landed in lmoxide e3a1a76 (2026-10-24) and the GUI uses them;
-item 3 is still open.
+**Status:** all landed and used by the GUI: items 1, 2, 4, 5 and 6 in lmoxide e3a1a76, item 3
+in lmoxide 0c899f5 (2026-10-24).
 
 ## Patch server
 
@@ -45,11 +45,17 @@ job asks the API's `/v1/status` and `/v1/config` (`worker::game_status`, best ef
 Server card shows "online, N players", "maintenance" or "offline" next to the game server, a
 website link, and "Create an account" (to the website) when the API says registration is open.
 
-### 3. Patcher downloads (later)
+### 3. Patcher downloads (done)
 
 A way to distribute and update the patcher itself, e.g. `GET /lmoxide/v1/patcher/{platform}`
 listing signed builds, would let a server hand out this window instead of the client kit.
 Not needed yet.
+
+**Done:** `GET /lmoxide/v1/patchers/{platform}` lists `SignedRelease`s (own signing context)
+of the builds in the patch server's `--patcher-dir`; `Info::patchers` names the newest versions.
+`lmoxide_patch::selfupdate::{check, install, cleanup}` verify a release with an install's key
+and swap the program. The GUI offers it as a banner (Settings can turn it off); the CLI has
+`lmoxide-patcher self-update`.
 
 ## Patcher library (`lmoxide-patch`)
 

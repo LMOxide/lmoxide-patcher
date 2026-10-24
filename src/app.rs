@@ -15,18 +15,21 @@ use std::{
 use eframe::egui::{self, Align, Color32, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
 use lmoxide_patch::{
     Info, Manifest, Platform,
+    release::Release,
     sync::{Plan, Progress, Reason},
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
     install,
-    settings::Settings,
+    settings::{self, Settings},
     theme::{self, Kind, icon},
     worker::{self, GameStatus, Job, Msg, Outbox, Request, Status},
 };
 
 const LOG_LINES: usize = 500;
+/// Tags the messages of a patcher update, which runs beside the other jobs.
+const PATCHER_JOB: u64 = u64::MAX;
 /// How often to ask again while the server indexes.
 const RECHECK: Duration = Duration::from_secs(10);
 
@@ -54,6 +57,17 @@ pub struct PatcherApp {
     /// The install directory was edited and not yet checked.
     dir_edited: bool,
     show_settings: bool,
+    /// The profile dialog is open.
+    show_profile: bool,
+    /// A newer build of this patcher the server offers.
+    patcher_update: Option<Release>,
+    /// Installing it.
+    patcher_installing: bool,
+    /// Installed (its version): restart to use it.
+    patcher_updated: Option<String>,
+    /// This program, as found at startup (on Linux `current_exe` names the deleted file once
+    /// an update replaced it).
+    exe: Option<PathBuf>,
     trust: Option<TrustPrompt>,
     verified: Option<Plan>,
     log: VecDeque<(Level, String)>,
@@ -137,7 +151,8 @@ impl RunState {
 impl PatcherApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Runtime) -> Self {
         theme::install(&cc.egui_ctx);
-        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        let mut settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        settings.normalize();
         let (tx, rx) = channel();
         let mut app = Self {
             rt,
@@ -157,6 +172,11 @@ impl PatcherApp {
             password: String::new(),
             dir_edited: false,
             show_settings: false,
+            show_profile: false,
+            patcher_update: None,
+            patcher_installing: false,
+            patcher_updated: None,
+            exe: std::env::current_exe().ok(),
             trust: None,
             verified: None,
             log: VecDeque::new(),
@@ -166,7 +186,7 @@ impl PatcherApp {
     }
 
     fn dir(&self) -> PathBuf {
-        PathBuf::from(self.settings.dir.trim())
+        PathBuf::from(self.settings.profile().dir.trim())
     }
 
     fn busy(&self) -> Option<Job> {
@@ -187,13 +207,13 @@ impl PatcherApp {
 
     /// Server, directory or platform changed: forget what we knew and check again.
     fn location_changed(&mut self) {
-        self.installed = worker::installed(&self.dir(), self.settings.platform);
+        self.installed = worker::installed(&self.dir(), self.settings.profile().platform);
         self.info = None;
         self.game = None;
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
-        if self.settings.server.trim().is_empty() {
+        if self.settings.profile().server.trim().is_empty() {
             self.cancel();
             self.error = None;
         } else {
@@ -215,12 +235,13 @@ impl PatcherApp {
         self.recheck_at = None;
         let req = Request {
             job,
-            server: self.settings.server.trim().to_string(),
+            server: self.settings.profile().server.trim().to_string(),
             dir: self.dir(),
-            platform: self.settings.platform,
+            platform: self.settings.profile().platform,
             jobs: self.settings.jobs,
             trust,
             cancel: Arc::new(AtomicBool::new(false)),
+            patcher_updates: self.settings.check_patcher_updates && self.patcher_updated.is_none(),
         };
         let cancel = req.cancel.clone();
         self.task = Some((job, self.rt.spawn(worker::run(req, self.out.for_job(self.job_id))), cancel));
@@ -249,6 +270,14 @@ impl PatcherApp {
                 self.info = Some(info);
             }
             Msg::Game(g) => self.game = Some(g),
+            Msg::PatcherUpdate(r) => {
+                if self.patcher_update.as_ref().is_none_or(|old| old.version != r.version) {
+                    self.log(Level::Info, format!("the server offers {} {}", r.name, r.version));
+                }
+                self.patcher_update = Some(r);
+            }
+            Msg::PatcherUpdated(_) => unreachable!("handled in drain"),
+            Msg::Log(line) => self.log(Level::Info, line),
             Msg::Status(s) => {
                 if matches!(s, Status::Indexing) {
                     self.recheck_at = Some(Instant::now() + RECHECK);
@@ -326,9 +355,10 @@ impl PatcherApp {
         while let Ok((id, msg)) = self.rx.try_recv() {
             match msg {
                 Msg::PickedDir(d) => {
-                    self.settings.dir = d.display().to_string();
+                    self.settings.profile_mut().dir = d.display().to_string();
                     self.location_changed();
                 }
+                msg if id == PATCHER_JOB => self.patcher_msg(msg),
                 msg if id == self.job_id => self.handle(msg),
                 _ => {}
             }
@@ -339,6 +369,81 @@ impl PatcherApp {
         if self.task.is_none() && self.recheck_at.is_some_and(|t| Instant::now() >= t) {
             self.start(Job::Check, None);
         }
+    }
+
+    fn patcher_msg(&mut self, msg: Msg) {
+        self.patcher_installing = false;
+        match msg {
+            Msg::PatcherUpdated(version) => {
+                self.log(Level::Info, format!("the patcher was updated to {version}; restart to use it"));
+                self.patcher_update = None;
+                self.patcher_updated = Some(version);
+            }
+            Msg::Failed(e) => {
+                self.log(Level::Error, e.clone());
+                self.error = Some(e);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_patcher(&mut self) {
+        let Some(r) = self.patcher_update.clone() else { return };
+        let Some(exe) = self.exe.clone() else {
+            self.error = Some("can't tell where this program is, so it can't update itself".into());
+            return;
+        };
+        self.patcher_installing = true;
+        self.log(Level::Info, format!("downloading {} {}", r.name, r.version));
+        let server = self.settings.profile().server.trim().to_string();
+        self.rt.spawn(worker::install_patcher(server, r, exe, self.out.for_job(PATCHER_JOB)));
+    }
+
+    /// Starts the new build and closes this window.
+    fn restart(&mut self, ctx: &egui::Context) {
+        let Some(exe) = &self.exe else { return };
+        let started = std::process::Command::new(exe).spawn();
+        match started {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                let e = format!("restarting the patcher: {e}");
+                self.log(Level::Error, e.clone());
+                self.error = Some(e);
+            }
+        }
+    }
+
+    fn switch_profile(&mut self, index: usize) {
+        if index == self.settings.current || index >= self.settings.profiles.len() {
+            return;
+        }
+        self.cancel();
+        self.settings.current = index;
+        self.password.clear();
+        self.log(Level::Info, format!("profile {}", self.settings.profile().name));
+        self.location_changed();
+    }
+
+    /// A new profile like the current one (same server, install and runner), without the account.
+    fn new_profile(&mut self) {
+        let mut p = self.settings.profile().clone();
+        p.name = self.settings.unique_name("New profile");
+        p.username.clear();
+        self.settings.profiles.push(p);
+        self.switch_profile(self.settings.profiles.len() - 1);
+        self.show_profile = true;
+    }
+
+    fn delete_profile(&mut self) {
+        if self.settings.profiles.len() < 2 {
+            return;
+        }
+        let gone = self.settings.profiles.remove(self.settings.current);
+        self.log(Level::Info, format!("deleted profile {} (its install stays on disk)", gone.name));
+        self.settings.current = self.settings.current.min(self.settings.profiles.len() - 1);
+        self.cancel();
+        self.password.clear();
+        self.location_changed();
     }
 
     fn browse(&self) {
@@ -357,8 +462,7 @@ impl PatcherApp {
 
     fn play(&mut self) {
         let Some(m) = &self.installed else { return };
-        let runner = if m.platform == Platform::Windows { self.settings.windows_runner.as_str() } else { "" };
-        match install::launch(&self.dir(), m, self.settings.username.trim(), &self.password, runner) {
+        match install::launch(&self.dir(), m, self.settings.profile(), &self.password) {
             Ok(()) => self.log(Level::Info, format!("started {}", m.launch.executable)),
             Err(e) => {
                 let e = format!("{e:#}");
@@ -372,7 +476,7 @@ impl PatcherApp {
 
     /// The header's connection chip.
     fn connection(&self) -> (Color32, &'static str) {
-        if self.settings.server.trim().is_empty() {
+        if self.settings.profile().server.trim().is_empty() {
             (theme::WEAK, "No server")
         } else if self.info.is_some() {
             (theme::GREEN, "Online")
@@ -456,7 +560,7 @@ impl PatcherApp {
                 "It's still indexing its client files. This updates by itself when it's done.".into(),
             ),
             (Some(Job::Check), None) => {
-                (icon::PULSE, theme::BLUE, "Checking for updates…".into(), self.settings.server.trim().into())
+                (icon::PULSE, theme::BLUE, "Checking for updates…".into(), self.settings.profile().server.trim().into())
             }
             (_, Some(Status::UpToDate)) => (icon::CHECK_CIRCLE, theme::GREEN, "Ready to play".into(), summary()),
             (_, Some(Status::UpdateAvailable)) => {
@@ -466,7 +570,7 @@ impl PatcherApp {
                 icon::CLOUD_DOWN,
                 theme::ACCENT,
                 "Not installed yet".into(),
-                format!("{} to download  ·  {} client", human_bytes(*bytes), platform_name(self.settings.platform)),
+                format!("{} to download  ·  {} client", human_bytes(*bytes), platform_name(self.settings.profile().platform)),
             ),
             (_, Some(Status::KeyChanged)) => (
                 icon::WARNING,
@@ -474,7 +578,7 @@ impl PatcherApp {
                 "The server's key changed".into(),
                 "Its files are signed with a different key. Update to review it.".into(),
             ),
-            (None, None) if self.settings.server.trim().is_empty() => (
+            (None, None) if self.settings.profile().server.trim().is_empty() => (
                 icon::GLOBE,
                 theme::WEAK,
                 "Choose a server".into(),
@@ -546,7 +650,7 @@ impl PatcherApp {
 
     fn actions_ui(&mut self, ui: &mut egui::Ui) {
         let working = self.working();
-        let has_server = !self.settings.server.trim().is_empty();
+        let has_server = !self.settings.profile().server.trim().is_empty();
         let installed = self.installed.is_some();
         let needs_sync =
             matches!(self.status, Some(Status::NotInstalled { .. } | Status::UpdateAvailable | Status::KeyChanged));
@@ -556,6 +660,7 @@ impl PatcherApp {
         let small = vec2(104.0, 34.0);
         // Enter outside a text field (and outside a dialog) presses the yellow button.
         let enter = !self.show_settings
+            && !self.show_profile
             && self.trust.is_none()
             && ui.memory(|m| m.focused().is_none())
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -596,7 +701,7 @@ impl PatcherApp {
     fn account_ui(&mut self, ui: &mut egui::Ui) {
         theme::card_title(ui, icon::USER, "Account");
         theme::field_label(ui, "Username");
-        ui.add(theme::text_field(&mut self.settings.username).hint_text("Optional").desired_width(f32::INFINITY));
+        ui.add(theme::text_field(&mut self.settings.profile_mut().username).hint_text("Optional").desired_width(f32::INFINITY));
         theme::field_label(ui, "Password");
         let r = ui.add(theme::text_field(&mut self.password).password(true).desired_width(f32::INFINITY));
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.installed.is_some() {
@@ -620,7 +725,7 @@ impl PatcherApp {
 
         theme::field_label(ui, "Patch server");
         ui.horizontal(|ui| {
-            let edit = theme::text_field(&mut self.settings.server)
+            let edit = theme::text_field(&mut self.settings.profile_mut().server)
                 .hint_text("http://lmo.example.org:8080")
                 .desired_width(ui.available_width() - 42.0);
             let r = ui.add_enabled(idle, edit);
@@ -631,7 +736,7 @@ impl PatcherApp {
 
         theme::field_label(ui, "Install folder");
         ui.horizontal(|ui| {
-            let edit = theme::text_field(&mut self.settings.dir).desired_width(ui.available_width() - 42.0);
+            let edit = theme::text_field(&mut self.settings.profile_mut().dir).desired_width(ui.available_width() - 42.0);
             let r = ui.add_enabled(idle, edit);
             self.dir_edited |= r.changed();
             changed |= r.lost_focus() && self.dir_edited;
@@ -645,7 +750,14 @@ impl PatcherApp {
             .into_iter()
             .map(|p| (p, if p == Platform::Windows { icon::WINDOWS } else { icon::LINUX }, platform_name(p)))
             .collect();
-        changed |= theme::segmented(ui, &mut self.settings.platform, &options, idle);
+        let before = self.settings.profile().platform;
+        if theme::segmented(ui, &mut self.settings.profile_mut().platform, &options, idle) {
+            changed = true;
+            let p = self.settings.profile_mut();
+            if p.runner == settings::default_runner(before) {
+                p.runner = settings::default_runner(p.platform).into();
+            }
+        }
 
         if changed {
             self.location_changed();
@@ -741,6 +853,141 @@ impl PatcherApp {
         });
     }
 
+    /// Choosing, adding and editing profiles.
+    fn profile_bar(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.working();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{}  Profile", icon::USER)).family(theme::semibold()).color(theme::WEAK));
+            let mut pick = None;
+            ui.add_enabled_ui(idle, |ui| {
+                egui::ComboBox::from_id_salt("profile")
+                    .selected_text(RichText::new(&self.settings.profile().name).family(theme::semibold()))
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in self.settings.profiles.iter().enumerate() {
+                            let detail = match p.username.trim() {
+                                "" => platform_name(p.platform).to_string(),
+                                u => format!("{u}  ·  {}", platform_name(p.platform)),
+                            };
+                            let text = format!("{}   {detail}", p.name);
+                            if ui.selectable_label(i == self.settings.current, text).clicked() {
+                                pick = Some(i);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Each profile has its own server, install, client, account and way of starting it")
+            });
+            if let Some(i) = pick {
+                self.switch_profile(i);
+            }
+            if ui.add_enabled(idle, egui::Button::new("Edit…")).clicked() {
+                self.show_profile = true;
+            }
+            if ui.add_enabled(idle, egui::Button::new("New")).on_hover_text("A copy of this profile without the account").clicked() {
+                self.new_profile();
+            }
+        });
+    }
+
+    /// A newer build of this patcher, or the one just installed.
+    fn patcher_banner(&mut self, ui: &mut egui::Ui) {
+        if let Some(version) = self.patcher_updated.clone() {
+            theme::callout(ui, icon::CHECK_CIRCLE, theme::GREEN, &format!("The patcher was updated to {version}. Restart it to use the new version."));
+            if ui.button("Restart the patcher").clicked() {
+                let ctx = ui.ctx().clone();
+                self.restart(&ctx);
+            }
+            return;
+        }
+        let Some(r) = &self.patcher_update else { return };
+        let text = format!(
+            "The server offers version {} of this patcher (you have {}, {} to download).",
+            r.version,
+            worker::PATCHER_VERSION,
+            human_bytes(r.size)
+        );
+        theme::callout(ui, icon::CLOUD_DOWN, theme::BLUE, &text);
+        ui.horizontal(|ui| {
+            let label = if self.patcher_installing { "Updating the patcher…" } else { "Update the patcher" };
+            if ui.add_enabled(!self.patcher_installing, egui::Button::new(label)).clicked() {
+                self.update_patcher();
+            }
+            if ui.add_enabled(!self.patcher_installing, egui::Button::new("Not now")).clicked() {
+                self.patcher_update = None;
+            }
+        });
+    }
+
+    fn profile_window(&mut self, ctx: &egui::Context) {
+        if !self.show_profile {
+            return;
+        }
+        let mut delete = false;
+        let can_delete = self.settings.profiles.len() > 1;
+        let modal = egui::Modal::new(egui::Id::unique("profile")).frame(dialog_frame()).show(ctx, |ui| {
+            ui.set_width(440.0_f32.min(ctx.content_rect().width() - 80.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::USER).size(20.0).color(theme::ACCENT));
+                ui.label(RichText::new("Profile").family(theme::display()).size(20.0));
+            });
+            ui.add_space(6.0);
+            let p = self.settings.profile_mut();
+            theme::field_label(ui, "Name");
+            ui.add(theme::text_field(&mut p.name).desired_width(f32::INFINITY));
+            ui.label(
+                RichText::new("Server, install folder, client and username are set in the main window.")
+                    .size(12.0)
+                    .color(theme::WEAK),
+            );
+            theme::field_label(ui, "Start the client with");
+            let hint = match settings::default_runner(p.platform) {
+                "" => "none (starts it directly)",
+                r => r,
+            };
+            ui.add(theme::text_field(&mut p.runner).hint_text(hint).desired_width(f32::INFINITY));
+            ui.label(
+                RichText::new("A program to run the client through, e.g. wine, proton run, gamemoderun. Empty starts it directly.")
+                    .size(12.0)
+                    .color(theme::WEAK),
+            );
+            theme::field_label(ui, "Extra arguments");
+            ui.add(theme::text_field(&mut p.args).hint_text("none").desired_width(f32::INFINITY));
+            theme::field_label(ui, "Environment");
+            ui.add(
+                egui::TextEdit::multiline(&mut p.env)
+                    .hint_text("NAME=value, one per line")
+                    .desired_rows(3)
+                    .font(egui::TextStyle::Monospace)
+                    .margin(Margin::symmetric(10, 7))
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let done = theme::big_button(ui, Kind::Primary, "", "Done", true, vec2(96.0, 34.0)).clicked();
+                if can_delete
+                    && theme::big_button(ui, Kind::Danger, icon::X, "Delete profile", true, vec2(150.0, 34.0))
+                        .on_hover_text("Forgets this profile; its install stays on disk")
+                        .clicked()
+                {
+                    delete = true;
+                }
+                done
+            })
+            .inner
+        });
+        let p = self.settings.profile_mut();
+        if p.name.trim().is_empty() {
+            p.name = "Profile".into();
+        }
+        if delete {
+            self.show_profile = false;
+            self.delete_profile();
+        } else if modal.inner || modal.should_close() {
+            self.show_profile = false;
+        }
+    }
+
     fn log_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let caret = if self.settings.show_log { icon::CARET_DOWN } else { icon::CARET_UP };
@@ -780,11 +1027,10 @@ impl PatcherApp {
             ui.add_space(6.0);
             theme::field_label(ui, "Parallel downloads");
             ui.add(egui::Slider::new(&mut self.settings.jobs, 1..=16));
-            if !cfg!(windows) {
-                theme::field_label(ui, "Run the Windows client with");
-                ui.add(theme::text_field(&mut self.settings.windows_runner).hint_text("wine").desired_width(f32::INFINITY));
-                ui.label(RichText::new("For example wine, or a Proton wrapper. Empty starts LMO.exe directly.").size(12.0).color(theme::WEAK));
-            }
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.settings.check_patcher_updates, "Offer newer versions of this patcher")
+                .on_hover_text("When the server has a newer build signed with the key your install trusts");
+            ui.label(RichText::new(format!("{} {}", worker::PATCHER_NAME, worker::PATCHER_VERSION)).size(12.0).color(theme::WEAK));
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 theme::big_button(ui, Kind::Primary, "", "Done", true, vec2(96.0, 34.0)).clicked()
@@ -883,6 +1129,8 @@ impl eframe::App for PatcherApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(18))).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 14.0;
+                self.profile_bar(ui);
+                self.patcher_banner(ui);
                 theme::card(ui, |ui| self.status_ui(ui));
                 self.verified_ui(ui);
                 if ui.available_width() >= 600.0 {
@@ -900,6 +1148,7 @@ impl eframe::App for PatcherApp {
 
         let ctx = ui.ctx().clone();
         self.settings_window(&ctx);
+        self.profile_window(&ctx);
         self.trust_window(&ctx);
         #[cfg(debug_assertions)]
         dev_screenshot(&ctx);

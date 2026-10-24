@@ -30,7 +30,7 @@ portal; without one, type the path instead.
 
 ## Using it
 
-The window shows one status card at the top (what state the install is in, progress while
+The window shows the **profile** in use at the top, then one status card (what state the install is in, progress while
 installing, and the main button), an **Account** and an **Installation** card, and the server's
 details. The header's chip says whether the server answered; **Activity** at the bottom expands
 into the log.
@@ -52,7 +52,34 @@ into the log.
    window. The username is remembered; the password never is.
 
 Enter (outside a text field) presses the yellow button. The gear opens the settings: parallel
-downloads, and the command that runs the Windows client on other systems (`wine` by default).
+downloads, and whether to offer newer versions of the patcher.
+
+### Profiles
+
+A profile is one way to play: patch server, install folder, client (Linux or Windows),
+username, and how to start the client. Pick one in the **Profile** list at the top; **New**
+copies the current one without its account (several profiles can share an install, e.g. for
+two accounts, or point at different servers or clients). **Edit…** sets the profile's name and
+how it starts the client:
+
+- **Start the client with**: a program to run it through, e.g. `wine` (the default for the
+  Windows client on Linux), `proton run`, `gamemoderun`; empty starts it directly.
+- **Extra arguments**, added after the server's own.
+- **Environment**: `NAME=value` lines, e.g. `WINEPREFIX=/home/me/.wine-lmo`.
+
+Deleting a profile forgets it; its install stays on disk. Settings from the first version (one
+server and folder) become the first profile.
+
+### Updating the patcher
+
+If the server hands out patcher builds (`--patcher-dir` on the patch server, see
+`docs/PATCHING.md` in the lmoxide repo) and has a newer `lmoxide-patcher-gui` for this system,
+a banner offers it. The build must be signed with the key the current profile's install trusts,
+so nothing is offered before a first install. **Update the patcher** downloads it next to this
+program, checks it against the signed sha256 and swaps it in; **Restart the patcher** then
+starts the new version. Settings can turn the offer off. To publish a build, copy it to the
+server's patcher dir as `lmoxide-patcher-gui-<version>-<linux|windows>[.exe]` (the version from
+`Cargo.toml`) and send the server SIGHUP.
 
 ### Trusting a server
 
@@ -71,13 +98,13 @@ repo. Window settings are kept by eframe (`~/.local/share/lmoxide-patcher/` on L
 | File | |
 |---|---|
 | `src/main.rs` | window and tokio runtime setup |
-| `src/app.rs` | the window: header, status and progress, cards, log, settings and trust dialogs |
+| `src/app.rs` | the window: header, profile bar, patcher update banner, status and progress, cards, log, settings, profile and trust dialogs |
 | `src/theme.rs` | colours, fonts, window icon and the hand-drawn widgets |
 | `src/worker.rs` | background jobs (check, install/update/repair, verify) reporting over a channel |
 | `src/install.rs` | starting the client (`Launch::command` plus the Windows runner) |
 | `src/settings.rs` | remembered settings |
 | `assets/fonts/` | Inter and Phosphor, subset to Latin and the icons used |
-| `docs/API-PROPOSALS.md` | changes to lmoxide this patcher asked for (all but item 3 landed) |
+| `docs/API-PROPOSALS.md` | changes to lmoxide this patcher asked for (all landed) |
 
 ## Development
 

@@ -16,6 +16,8 @@ use lmoxide_patch::{
     Error, Info, Manifest, Platform, SignedManifest,
     client::{Client, Trust, stored_key},
     manifest::parse_public_key,
+    release::{Release, compare_versions},
+    selfupdate,
     sync::{self, Options, Plan, Progress, Report},
 };
 
@@ -40,7 +42,14 @@ pub struct Request {
     pub trust: Option<String>,
     /// Set by the window to stop hashing and downloads (the task is aborted too).
     pub cancel: Arc<AtomicBool>,
+    /// Look for a newer build of this patcher on the server (checks only).
+    pub patcher_updates: bool,
 }
+
+/// This program's name in the server's patcher releases.
+pub const PATCHER_NAME: &str = env!("CARGO_PKG_NAME");
+/// This build's version.
+pub const PATCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The game server as the server's API (`Info::api_url`) reports it.
 #[derive(Debug, Clone)]
@@ -73,6 +82,10 @@ pub enum Status {
 pub enum Msg {
     Info(Info),
     Game(GameStatus),
+    /// The server offers a newer build of this patcher, signed with the install's key.
+    PatcherUpdate(Release),
+    /// That build replaced this program (`version`); a restart runs it.
+    PatcherUpdated(String),
     Status(Status),
     /// Waiting for the server to finish indexing.
     Waiting,
@@ -82,6 +95,8 @@ pub enum Msg {
     Verified(Plan),
     Synced { plan: Plan, report: Report, manifest: Manifest },
     Failed(String),
+    /// A note for the activity log.
+    Log(String),
     PickedDir(PathBuf),
 }
 
@@ -140,6 +155,9 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
         let out = out.clone();
         tokio::spawn(async move { out.send(Msg::Game(game_status(&api).await)) });
     }
+    if req.patcher_updates {
+        patcher_update(&client, &info, req, out).await;
+    }
     let installed = installed(&req.dir, req.platform);
     // The server's hints answer most checks without downloading the manifest.
     match (&installed, info.revisions.get(&req.platform)) {
@@ -190,6 +208,35 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
     };
     out.send(Msg::Status(status));
     Ok(())
+}
+
+/// Offers a newer build of this patcher if `info` lists one and it verifies with the key the
+/// install trusts (no trusted key yet: nothing is offered; best effort, failures are logged).
+async fn patcher_update(client: &Client, info: &Info, req: &Request, out: &Outbox) {
+    let platform = Platform::host();
+    let listed = info.patchers.get(PATCHER_NAME).and_then(|b| b.get(&platform));
+    if !listed.is_some_and(|v| compare_versions(v, PATCHER_VERSION).is_gt()) {
+        return;
+    }
+    let Ok(Some(key)) = stored_key(&req.dir) else { return };
+    match selfupdate::check(client, PATCHER_NAME, platform, PATCHER_VERSION, &key).await {
+        Ok(Some(r)) => out.send(Msg::PatcherUpdate(r)),
+        Ok(None) => {}
+        Err(e) => out.send(Msg::Log(format!("patcher update check: {}", describe(client, platform, e)))),
+    }
+}
+
+/// Replaces this program (`exe`) with `release` from `server`.
+pub async fn install_patcher(server: String, release: Release, exe: PathBuf, out: Outbox) {
+    let result = async {
+        let client = Client::new(&server)?;
+        selfupdate::install(&client, &release, &exe, &sync::no_progress()).await
+    }
+    .await;
+    match result {
+        Ok(()) => out.send(Msg::PatcherUpdated(release.version)),
+        Err(e) => out.send(Msg::Failed(format!("updating the patcher: {e}"))),
+    }
 }
 
 /// Asks the server's API about the game server (best effort: errors leave fields empty).

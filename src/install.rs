@@ -2,15 +2,18 @@
 
 use std::{path::Path, process::Stdio};
 
-use lmoxide_patch::{Manifest, Platform};
+use lmoxide_patch::Manifest;
 
-/// Starts the client as the manifest's `launch` says, in `dir`. With a `username`, the
-/// `login_args` log in automatically. `runner` wraps the Windows client on other systems.
-pub fn launch(dir: &Path, m: &Manifest, username: &str, password: &str, runner: &str) -> anyhow::Result<()> {
-    let wrapper: Vec<&str> =
-        if m.platform == Platform::Windows && !cfg!(windows) { runner.split_whitespace().collect() } else { Vec::new() };
+use crate::settings::Profile;
+
+/// Starts the client as the manifest's `launch` says, in `dir`, the way `profile` says: through
+/// its runner, with its extra arguments and environment. With a username, the `login_args` log
+/// in automatically.
+pub fn launch(dir: &Path, m: &Manifest, profile: &Profile, password: &str) -> anyhow::Result<()> {
+    let username = profile.username.trim();
     let login = (!username.is_empty()).then_some((username, password));
-    let mut cmd = m.launch.command(dir, login, &wrapper)?;
+    let mut cmd = m.launch.command(dir, login, &profile.runner_words())?;
+    cmd.args(profile.extra_args()).envs(profile.extra_env());
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("starting {}: {e}", m.launch.executable))?;
     // Reap it when it exits.
@@ -22,12 +25,12 @@ pub fn launch(dir: &Path, m: &Manifest, username: &str, password: &str, runner: 
 mod tests {
     use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 
-    use lmoxide_patch::{Launch, manifest::MANIFEST_FORMAT};
+    use lmoxide_patch::{Launch, Platform, manifest::MANIFEST_FORMAT};
 
     use super::*;
 
     fn manifest(dir: &Path) -> Manifest {
-        let script = "#!/bin/sh\necho \"$PWD|$GREETING|$*\" > out.txt\n";
+        let script = "#!/bin/sh\necho \"$PWD|$GREETING|$EXTRA|$*\" > out.txt\n";
         std::fs::write(dir.join("LMO"), script).unwrap();
         std::fs::set_permissions(dir.join("LMO"), std::fs::Permissions::from_mode(0o755)).unwrap();
         Manifest {
@@ -61,27 +64,47 @@ mod tests {
         panic!("the client didn't start");
     }
 
+    fn profile(username: &str) -> Profile {
+        Profile { username: username.into(), runner: String::new(), ..Default::default() }
+    }
+
     #[test]
     fn launches_with_env_and_login() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().canonicalize().unwrap();
         let m = manifest(&d);
-        launch(&d, &m, "blake", "p w", "wine").unwrap();
-        assert_eq!(output(&d), format!("{}|hi|-verified -username blake -password p w\n", d.display()));
+        launch(&d, &m, &profile("blake"), "p w").unwrap();
+        assert_eq!(output(&d), format!("{}|hi||-verified -username blake -password p w\n", d.display()));
 
         // no username: no login arguments
         std::fs::remove_file(d.join("out.txt")).unwrap();
-        launch(&d, &m, "", "secret", "").unwrap();
-        assert_eq!(output(&d), format!("{}|hi|-verified\n", d.display()));
+        launch(&d, &m, &profile(""), "secret").unwrap();
+        assert_eq!(output(&d), format!("{}|hi||-verified\n", d.display()));
+    }
+
+    #[test]
+    fn profile_runner_args_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().canonicalize().unwrap();
+        let m = manifest(&d);
+        let p = Profile {
+            runner: "sh".into(),
+            args: "-windowed".into(),
+            env: "EXTRA=yes\nGREETING=hello".into(),
+            ..profile("")
+        };
+        launch(&d, &m, &p, "").unwrap();
+        assert_eq!(output(&d), format!("{}|hello|yes|-verified -windowed\n", d.display()));
     }
 
     #[test]
     fn refuses_missing_or_unsafe_executables() {
         let dir = tempfile::tempdir().unwrap();
         let mut m = manifest(dir.path());
+        assert_eq!(m.platform, Platform::Linux);
         m.launch.executable = "../LMO".into();
-        assert!(launch(dir.path(), &m, "", "", "").is_err());
+        assert!(launch(dir.path(), &m, &profile(""), "").is_err());
         m.launch.executable = "Missing".into();
-        assert!(launch(dir.path(), &m, "", "", "").is_err());
+        assert!(launch(dir.path(), &m, &profile(""), "").is_err());
     }
 }
