@@ -466,7 +466,16 @@ impl PatcherApp {
         });
     }
 
+    /// A username without a password: the client would finish patching and then hang on its
+    /// loading screen without ever contacting the server.
+    fn missing_password(&self) -> bool {
+        !self.settings.profile().username.trim().is_empty() && self.password.is_empty()
+    }
+
     fn play(&mut self) {
+        if self.missing_password() {
+            return;
+        }
         let Some(m) = &self.installed else { return };
         match install::launch(&self.dir(), m, self.settings.profile(), &self.password) {
             Ok(()) => self.log(Level::Info, format!("started {}", m.launch.executable)),
@@ -667,6 +676,8 @@ impl PatcherApp {
         let working = self.working();
         let has_server = !self.settings.profile().server.trim().is_empty();
         let installed = self.installed.is_some();
+        let can_play = !self.missing_password();
+        let play_hint = |r: egui::Response| r.on_disabled_hover_text("Enter your password (or clear the username)");
         let needs_sync =
             matches!(self.status, Some(Status::NotInstalled { .. } | Status::UpdateAvailable | Status::KeyChanged));
         let sync_label = if installed || self.existing { "Update" } else { "Install" };
@@ -689,10 +700,10 @@ impl PatcherApp {
                 if theme::big_button(ui, Kind::Primary, sync_icon, sync_label, has_server, big).clicked() || (enter && has_server) {
                     self.start(Job::Sync { full: false }, None);
                 }
-                if installed && theme::big_button(ui, Kind::Secondary, icon::PLAY, "Play", true, big).clicked() {
+                if installed && play_hint(theme::big_button(ui, Kind::Secondary, icon::PLAY, "Play", can_play, big)).clicked() {
                     self.play();
                 }
-            } else if theme::big_button(ui, Kind::Primary, icon::PLAY, "Play", true, big).clicked() || enter {
+            } else if play_hint(theme::big_button(ui, Kind::Primary, icon::PLAY, "Play", can_play, big)).clicked() || enter {
                 self.play();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -723,6 +734,14 @@ impl PatcherApp {
             self.play();
         }
         ui.add_space(2.0);
+        if self.missing_password() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} Enter your password to play.", icon::WARNING_CIRCLE)).size(12.0).color(theme::AMBER),
+                )
+                .wrap(),
+            );
+        }
         ui.add(
             egui::Label::new(
                 RichText::new("With a username, Play logs you in automatically. The password is never saved.")
