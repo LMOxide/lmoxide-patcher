@@ -4,9 +4,14 @@
 //! A job that meets an unknown key (fresh install) or a changed one stops with
 //! [`Msg::Trust`]; if the user accepts, the window runs the job again with that key pinned.
 
-use std::{path::PathBuf, sync::mpsc::Sender, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool, mpsc::Sender},
+    time::Duration,
+};
 
 use eframe::egui;
+use serde::Deserialize;
 use lmoxide_patch::{
     Error, Info, Manifest, Platform, SignedManifest,
     client::{Client, Trust, stored_key},
@@ -33,6 +38,24 @@ pub struct Request {
     pub jobs: usize,
     /// A key the user accepted (hex), pinned instead of the stored one.
     pub trust: Option<String>,
+    /// Set by the window to stop hashing and downloads (the task is aborted too).
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// The game server as the server's API (`Info::api_url`) reports it.
+#[derive(Debug, Clone)]
+pub struct GameStatus {
+    /// `GET /v1/status`; `None` if the API didn't answer (or keeps its status private).
+    pub status: Option<ApiStatus>,
+    /// `GET /v1/config`; `None` for APIs without it.
+    pub registration_open: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiStatus {
+    pub game_server_online: bool,
+    pub players_online: Option<u32>,
+    pub maintenance: Option<bool>,
 }
 
 /// How the install compares with the server.
@@ -49,6 +72,7 @@ pub enum Status {
 
 pub enum Msg {
     Info(Info),
+    Game(GameStatus),
     Status(Status),
     /// Waiting for the server to finish indexing.
     Waiting,
@@ -98,21 +122,53 @@ pub async fn run(req: Request, out: Outbox) {
 fn describe(client: &Client, platform: Platform, e: Error) -> String {
     match e {
         Error::Status { status: 404, .. } => format!("{} doesn't offer a {platform} client", client.base_url()),
-        Error::Http(e) if e.is_connect() || e.is_timeout() => format!("can't reach {}: {e}", client.base_url()),
         e => e.to_string(),
     }
+}
+
+/// The install's saved manifest for `platform`, if it verifies with the trusted key.
+pub fn installed(dir: &std::path::Path, platform: Platform) -> Option<Manifest> {
+    sync::load_manifest(dir).ok().flatten().filter(|m| m.platform == platform)
 }
 
 async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
     let client = Client::new(&req.server).map_err(|e| e.to_string())?;
     let err = |e| describe(&client, req.platform, e);
-    out.send(Msg::Info(client.info().await.map_err(err)?));
-    let signed = match client.signed_manifest(req.platform).await {
+    let info = client.info().await.map_err(err)?;
+    out.send(Msg::Info(info.clone()));
+    if let Some(api) = info.api_url.clone() {
+        let out = out.clone();
+        tokio::spawn(async move { out.send(Msg::Game(game_status(&api).await)) });
+    }
+    let installed = installed(&req.dir, req.platform);
+    // The server's hints answer most checks without downloading the manifest.
+    match (&installed, info.revisions.get(&req.platform)) {
+        (Some(i), Some(rev)) if *rev == i.revision() => {
+            out.send(Msg::Status(Status::UpToDate));
+            return Ok(());
+        }
+        (None, _) if stored_key(&req.dir).map_err(err)?.is_none() => {
+            if let Some(&bytes) = info.install_bytes.get(&req.platform) {
+                out.send(Msg::Status(Status::NotInstalled { bytes }));
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    let fetched = match &installed {
+        Some(i) => client.signed_manifest_if_changed(req.platform, &i.revision()).await,
+        None => client.signed_manifest(req.platform).await.map(Some),
+    };
+    let signed = match fetched {
         Err(Error::NotReady { .. }) => {
             out.send(Msg::Status(Status::Indexing));
             return Ok(());
         }
-        r => r.map_err(err)?,
+        Ok(None) => {
+            out.send(Msg::Status(Status::UpToDate));
+            return Ok(());
+        }
+        r => r.map_err(err)?.unwrap(),
     };
     let status = match stored_key(&req.dir).map_err(err)? {
         // Nothing trusted yet: the size is only for display, the install verifies.
@@ -123,8 +179,8 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
             Status::NotInstalled { bytes }
         }
         Some(key) => match signed.verify_for(&key, req.platform) {
-            Ok(m) => match crate::install::installed(&req.dir) {
-                Some(i) if i.platform == req.platform && i.version == m.version => Status::UpToDate,
+            Ok(m) => match installed {
+                Some(i) if i.revision() == m.revision() => Status::UpToDate,
                 Some(_) => Status::UpdateAvailable,
                 None => Status::NotInstalled { bytes: m.files.iter().map(|f| f.size).sum() },
             },
@@ -134,6 +190,29 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
     };
     out.send(Msg::Status(status));
     Ok(())
+}
+
+/// Asks the server's API about the game server (best effort: errors leave fields empty).
+async fn game_status(api: &str) -> GameStatus {
+    let base = api.trim_end_matches('/');
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build();
+    let get = async |path: &str| -> Option<reqwest::Response> {
+        let r = http.as_ref().ok()?.get(format!("{base}{path}")).send().await.ok()?;
+        r.status().is_success().then_some(r)
+    };
+    #[derive(Deserialize)]
+    struct Config {
+        registration_open: bool,
+    }
+    let status = match get("/v1/status").await {
+        Some(r) => r.json::<ApiStatus>().await.ok(),
+        None => None,
+    };
+    let registration_open = match get("/v1/config").await {
+        Some(r) => r.json::<Config>().await.ok().map(|c| c.registration_open),
+        None => None,
+    };
+    GameStatus { status, registration_open }
 }
 
 /// The signed manifest, waiting while the server indexes.
@@ -179,13 +258,13 @@ async fn sync_job(req: &Request, out: &Outbox) -> Result<(), String> {
     };
     match req.job {
         Job::Sync { full } => {
-            let opts = Options { jobs: req.jobs.max(1), full_check: full, ..Default::default() };
+            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), ..Default::default() };
             let (plan, report) = sync::sync(&client, &req.dir, &manifest, &opts, &progress).await.map_err(err)?;
             sync::save_manifest(&req.dir, &signed).map_err(err)?;
             out.send(Msg::Synced { plan, report, manifest });
         }
         Job::Verify { full } => {
-            let opts = Options { jobs: req.jobs.max(1), full_check: full, ..Default::default() };
+            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), ..Default::default() };
             let plan = sync::plan(&req.dir, &manifest, &opts, &progress).await.map_err(err)?;
             out.send(Msg::Verified(plan));
         }

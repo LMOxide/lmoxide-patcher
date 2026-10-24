@@ -1,8 +1,6 @@
 //! What the window remembers between runs (eframe's storage, `~/.local/share/lmoxide-patcher/`
 //! on Linux). Never the password.
 
-use std::path::PathBuf;
-
 use lmoxide_patch::Platform;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +27,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             server: std::env::var("LMOXIDE_SERVER").unwrap_or_default(),
-            dir: default_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+            dir: lmoxide_patch::default_install_dir().map(|d| d.display().to_string()).unwrap_or_default(),
             platform: Platform::host(),
             jobs: 4,
             username: String::new(),
@@ -37,10 +35,4 @@ impl Default for Settings {
             show_log: false,
         }
     }
-}
-
-/// `~/Games/LMO`, like `lmoxide-patcher`.
-fn default_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join("Games").join("LMO"))
 }

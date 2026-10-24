@@ -4,7 +4,11 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::mpsc::{Receiver, channel},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, channel},
+    },
     time::{Duration, Instant},
 };
 
@@ -19,7 +23,7 @@ use crate::{
     install,
     settings::Settings,
     theme::{self, Kind, icon},
-    worker::{self, Job, Msg, Outbox, Request, Status},
+    worker::{self, GameStatus, Job, Msg, Outbox, Request, Status},
 };
 
 const LOG_LINES: usize = 500;
@@ -31,11 +35,13 @@ pub struct PatcherApp {
     settings: Settings,
     rx: Receiver<(u64, Msg)>,
     out: Outbox,
-    /// The running job; `job_id` tags its messages.
-    task: Option<(Job, JoinHandle<()>)>,
+    /// The running job and its cancel flag; `job_id` tags its messages.
+    task: Option<(Job, JoinHandle<()>, Arc<AtomicBool>)>,
     job_id: u64,
     run: RunState,
     info: Option<Info>,
+    /// The game server, from the server's API (`Info::api_url`).
+    game: Option<GameStatus>,
     /// Server warnings already logged.
     warned: Vec<String>,
     status: Option<Status>,
@@ -142,6 +148,7 @@ impl PatcherApp {
             job_id: 0,
             run: RunState::default(),
             info: None,
+            game: None,
             warned: Vec::new(),
             status: None,
             error: None,
@@ -163,7 +170,7 @@ impl PatcherApp {
     }
 
     fn busy(&self) -> Option<Job> {
-        self.task.as_ref().map(|(j, _)| *j)
+        self.task.as_ref().map(|(j, ..)| *j)
     }
 
     /// Installing, updating or verifying (not just checking).
@@ -180,8 +187,9 @@ impl PatcherApp {
 
     /// Server, directory or platform changed: forget what we knew and check again.
     fn location_changed(&mut self) {
-        self.installed = install::installed(&self.dir()).filter(|m| m.platform == self.settings.platform);
+        self.installed = worker::installed(&self.dir(), self.settings.platform);
         self.info = None;
+        self.game = None;
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
@@ -194,7 +202,8 @@ impl PatcherApp {
     }
 
     fn start(&mut self, job: Job, trust: Option<String>) {
-        if let Some((_, h)) = self.task.take() {
+        if let Some((_, h, cancel)) = self.task.take() {
+            cancel.store(true, Ordering::Relaxed);
             h.abort();
         }
         if job != Job::Check {
@@ -211,12 +220,16 @@ impl PatcherApp {
             platform: self.settings.platform,
             jobs: self.settings.jobs,
             trust,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
-        self.task = Some((job, self.rt.spawn(worker::run(req, self.out.for_job(self.job_id)))));
+        let cancel = req.cancel.clone();
+        self.task = Some((job, self.rt.spawn(worker::run(req, self.out.for_job(self.job_id))), cancel));
     }
 
     fn cancel(&mut self) {
-        if let Some((job, h)) = self.task.take() {
+        if let Some((job, h, cancel)) = self.task.take() {
+            // the abort alone would leave hashing threads running to the end
+            cancel.store(true, Ordering::Relaxed);
             h.abort();
             self.job_id += 1;
             if matches!(job, Job::Sync { .. }) {
@@ -235,6 +248,7 @@ impl PatcherApp {
                 }
                 self.info = Some(info);
             }
+            Msg::Game(g) => self.game = Some(g),
             Msg::Status(s) => {
                 if matches!(s, Status::Indexing) {
                     self.recheck_at = Some(Instant::now() + RECHECK);
@@ -308,7 +322,7 @@ impl PatcherApp {
     }
 
     fn drain(&mut self) {
-        let finished = self.task.as_ref().is_some_and(|(_, h)| h.is_finished());
+        let finished = self.task.as_ref().is_some_and(|(_, h, _)| h.is_finished());
         while let Ok((id, msg)) = self.rx.try_recv() {
             match msg {
                 Msg::PickedDir(d) => {
@@ -647,8 +661,24 @@ impl PatcherApp {
                     ui.label(RichText::new(k).color(theme::WEAK));
                 };
                 key(ui, "Game server");
-                ui.label(RichText::new(&info.universe_addr).monospace());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&info.universe_addr).monospace());
+                    if let Some((color, text)) = self.game.as_ref().and_then(game_line) {
+                        ui.label(RichText::new(text).color(color));
+                    }
+                });
                 ui.end_row();
+                if let Some(site) = &info.website {
+                    key(ui, "Website");
+                    let open = self.game.as_ref().and_then(|g| g.registration_open) == Some(true);
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to(format!("{} {site}", icon::GLOBE), site);
+                        if open {
+                            ui.hyperlink_to("Create an account", site);
+                        }
+                    });
+                    ui.end_row();
+                }
                 key(ui, "Clients");
                 let platforms: Vec<String> = info
                     .platforms
@@ -878,6 +908,18 @@ impl eframe::App for PatcherApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
+}
+
+/// "online, 3 players" and its colour, from the API's status.
+fn game_line(g: &GameStatus) -> Option<(Color32, String)> {
+    let s = g.status.as_ref()?;
+    Some(match (s.game_server_online, s.maintenance, s.players_online) {
+        (false, ..) => (theme::RED, "offline".into()),
+        (true, Some(true), _) => (theme::AMBER, "maintenance".into()),
+        (true, _, Some(1)) => (theme::GREEN, "online, 1 player".into()),
+        (true, _, Some(n)) => (theme::GREEN, format!("online, {n} players")),
+        (true, _, None) => (theme::GREEN, "online".into()),
+    })
 }
 
 fn dialog_frame() -> egui::Frame {

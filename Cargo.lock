@@ -1988,6 +1988,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "lmoxide-patch",
+ "reqwest",
  "rfd",
  "serde",
  "serde_json",

@@ -1,48 +1,18 @@
-//! The local side: what is installed, and starting it.
+//! Starting the installed client.
 
-use std::{
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{path::Path, process::Stdio};
 
-use lmoxide_patch::{
-    Manifest, Platform, STATE_DIR, SignedManifest,
-    client::stored_key,
-    sync::safe_join,
-};
-
-/// The manifest the last install or update saved (`.lmoxide/manifest.json`), checked against the
-/// install's trusted key. `None` if there is no install, or it doesn't verify.
-pub fn installed(dir: &Path) -> Option<Manifest> {
-    let key = stored_key(dir).ok()??;
-    let data = std::fs::read(dir.join(STATE_DIR).join("manifest.json")).ok()?;
-    let signed: SignedManifest = serde_json::from_slice(&data).ok()?;
-    signed.verify(&key).ok()
-}
+use lmoxide_patch::{Manifest, Platform};
 
 /// Starts the client as the manifest's `launch` says, in `dir`. With a `username`, the
 /// `login_args` log in automatically. `runner` wraps the Windows client on other systems.
 pub fn launch(dir: &Path, m: &Manifest, username: &str, password: &str, runner: &str) -> anyhow::Result<()> {
-    let l = &m.launch;
-    anyhow::ensure!(!l.executable.is_empty(), "the server's manifest doesn't say how to start the client");
-    let exe = safe_join(dir, &l.executable)?;
-    anyhow::ensure!(exe.is_file(), "{} is missing; update the install", l.executable);
-
-    let mut args: Vec<String> = l.args.clone();
-    if !username.is_empty() {
-        args.extend(l.login_args.iter().map(|a| a.replace("{username}", username).replace("{password}", password)));
-    }
-    let mut runner = runner.split_whitespace();
-    let mut cmd = match runner.next() {
-        Some(prog) if m.platform == Platform::Windows && !cfg!(windows) => {
-            let mut c = Command::new(prog);
-            c.args(runner).arg(&exe);
-            c
-        }
-        _ => Command::new(&exe),
-    };
-    cmd.args(&args).envs(&l.env).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("starting {}: {e}", l.executable))?;
+    let wrapper: Vec<&str> =
+        if m.platform == Platform::Windows && !cfg!(windows) { runner.split_whitespace().collect() } else { Vec::new() };
+    let login = (!username.is_empty()).then_some((username, password));
+    let mut cmd = m.launch.command(dir, login, &wrapper)?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("starting {}: {e}", m.launch.executable))?;
     // Reap it when it exits.
     std::thread::spawn(move || child.wait());
     Ok(())

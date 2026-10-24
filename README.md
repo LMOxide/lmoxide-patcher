@@ -74,10 +74,10 @@ repo. Window settings are kept by eframe (`~/.local/share/lmoxide-patcher/` on L
 | `src/app.rs` | the window: header, status and progress, cards, log, settings and trust dialogs |
 | `src/theme.rs` | colours, fonts, window icon and the hand-drawn widgets |
 | `src/worker.rs` | background jobs (check, install/update/repair, verify) reporting over a channel |
-| `src/install.rs` | the installed manifest and starting the client |
+| `src/install.rs` | starting the client (`Launch::command` plus the Windows runner) |
 | `src/settings.rs` | remembered settings |
 | `assets/fonts/` | Inter and Phosphor, subset to Latin and the icons used |
-| `docs/API-PROPOSALS.md` | changes to lmoxide this patcher would benefit from |
+| `docs/API-PROPOSALS.md` | changes to lmoxide this patcher asked for (all but item 3 landed) |
 
 ## Development
 
