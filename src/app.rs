@@ -1,4 +1,5 @@
-//! The window: server and install settings, status, progress, trust prompts, Play.
+//! The window: header, status with progress and the main buttons, account and installation
+//! cards, server details, the activity log, and the settings and trust dialogs.
 
 use std::{
     collections::VecDeque,
@@ -7,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Align, Color32, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
 use lmoxide_patch::{
     Info, Manifest, Platform,
     sync::{Plan, Progress, Reason},
@@ -17,10 +18,13 @@ use tokio::{runtime::Runtime, task::JoinHandle};
 use crate::{
     install,
     settings::Settings,
+    theme::{self, Kind, icon},
     worker::{self, Job, Msg, Outbox, Request, Status},
 };
 
 const LOG_LINES: usize = 500;
+/// How often to ask again while the server indexes.
+const RECHECK: Duration = Duration::from_secs(10);
 
 pub struct PatcherApp {
     rt: Runtime,
@@ -32,10 +36,18 @@ pub struct PatcherApp {
     job_id: u64,
     run: RunState,
     info: Option<Info>,
+    /// Server warnings already logged.
+    warned: Vec<String>,
     status: Option<Status>,
+    /// The last job's error, shown under the status.
+    error: Option<String>,
+    recheck_at: Option<Instant>,
     /// The verified manifest of the current install (for Play).
     installed: Option<Manifest>,
     password: String,
+    /// The install directory was edited and not yet checked.
+    dir_edited: bool,
+    show_settings: bool,
     trust: Option<TrustPrompt>,
     verified: Option<Plan>,
     log: VecDeque<(Level, String)>,
@@ -95,10 +107,30 @@ impl RunState {
             self.samples.pop_front();
         }
     }
+
+    fn fraction(&self) -> Option<f32> {
+        match self.stage {
+            Stage::Connecting | Stage::Waiting => None,
+            Stage::Checking { done, total } => Some(if total == 0 { 1.0 } else { done as f32 / total as f32 }),
+            Stage::Downloading => {
+                Some(if self.total_bytes == 0 { 1.0 } else { self.done_bytes as f32 / self.total_bytes as f32 })
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self.stage {
+            Stage::Connecting => "Fetching the file list…".into(),
+            Stage::Waiting => "Waiting for the server to finish indexing…".into(),
+            Stage::Checking { done, total } => format!("Checking files: {done} of {total}"),
+            Stage::Downloading => format!("Downloading: {} of {} files", self.files_done, self.files_total),
+        }
+    }
 }
 
 impl PatcherApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Runtime) -> Self {
+        theme::install(&cc.egui_ctx);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let (tx, rx) = channel();
         let mut app = Self {
@@ -110,9 +142,14 @@ impl PatcherApp {
             job_id: 0,
             run: RunState::default(),
             info: None,
+            warned: Vec::new(),
             status: None,
+            error: None,
+            recheck_at: None,
             installed: None,
             password: String::new(),
+            dir_edited: false,
+            show_settings: false,
             trust: None,
             verified: None,
             log: VecDeque::new(),
@@ -129,6 +166,11 @@ impl PatcherApp {
         self.task.as_ref().map(|(j, _)| *j)
     }
 
+    /// Installing, updating or verifying (not just checking).
+    fn working(&self) -> bool {
+        matches!(self.busy(), Some(Job::Sync { .. } | Job::Verify { .. }))
+    }
+
     fn log(&mut self, level: Level, msg: impl Into<String>) {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
@@ -139,11 +181,13 @@ impl PatcherApp {
     /// Server, directory or platform changed: forget what we knew and check again.
     fn location_changed(&mut self) {
         self.installed = install::installed(&self.dir()).filter(|m| m.platform == self.settings.platform);
+        self.info = None;
         self.status = None;
         self.verified = None;
+        self.dir_edited = false;
         if self.settings.server.trim().is_empty() {
-            self.info = None;
             self.cancel();
+            self.error = None;
         } else {
             self.start(Job::Check, None);
         }
@@ -158,6 +202,8 @@ impl PatcherApp {
         }
         self.job_id += 1;
         self.run = RunState::default();
+        self.error = None;
+        self.recheck_at = None;
         let req = Request {
             job,
             server: self.settings.server.trim().to_string(),
@@ -182,14 +228,19 @@ impl PatcherApp {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Info(info) => {
-                let known = self.info.as_ref().map(|i| i.warnings.as_slice()).unwrap_or_default();
-                let new: Vec<String> = info.warnings.iter().filter(|w| !known.contains(w)).cloned().collect();
+                let new: Vec<String> = info.warnings.iter().filter(|w| !self.warned.contains(w)).cloned().collect();
                 for w in new {
                     self.log(Level::Warn, format!("server: {w}"));
+                    self.warned.push(w);
                 }
                 self.info = Some(info);
             }
-            Msg::Status(s) => self.status = Some(s),
+            Msg::Status(s) => {
+                if matches!(s, Status::Indexing) {
+                    self.recheck_at = Some(Instant::now() + RECHECK);
+                }
+                self.status = Some(s);
+            }
             Msg::Waiting => {
                 self.run.stage = Stage::Waiting;
                 self.status = Some(Status::Indexing);
@@ -228,7 +279,10 @@ impl PatcherApp {
                 self.installed = Some(manifest);
                 self.status = Some(Status::UpToDate);
             }
-            Msg::Failed(e) => self.log(Level::Error, e),
+            Msg::Failed(e) => {
+                self.log(Level::Error, e.clone());
+                self.error = Some(e);
+            }
             Msg::PickedDir(_) => unreachable!("handled in drain"),
         }
     }
@@ -268,6 +322,9 @@ impl PatcherApp {
         if finished {
             self.task = None;
         }
+        if self.task.is_none() && self.recheck_at.is_some_and(|t| Instant::now() >= t) {
+            self.start(Job::Check, None);
+        }
     }
 
     fn browse(&self) {
@@ -289,50 +346,293 @@ impl PatcherApp {
         let runner = if m.platform == Platform::Windows { self.settings.windows_runner.as_str() } else { "" };
         match install::launch(&self.dir(), m, self.settings.username.trim(), &self.password, runner) {
             Ok(()) => self.log(Level::Info, format!("started {}", m.launch.executable)),
-            Err(e) => self.log(Level::Error, format!("{e:#}")),
+            Err(e) => {
+                let e = format!("{e:#}");
+                self.log(Level::Error, e.clone());
+                self.error = Some(e);
+            }
         }
     }
 
     // ---- drawing ----
 
-    fn location_ui(&mut self, ui: &mut egui::Ui) {
-        let idle = !matches!(self.busy(), Some(Job::Sync { .. } | Job::Verify { .. }));
-        let mut changed = false;
-        egui::Grid::new("location").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Server");
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut self.settings.server).hint_text("http://lmo.example.org:8080");
-                let r = ui.add_enabled(idle, edit.desired_width(ui.available_width() - 80.0));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(idle, egui::Button::new("Connect")).clicked() || enter {
-                    changed = true;
+    /// The header's connection chip.
+    fn connection(&self) -> (Color32, &'static str) {
+        if self.settings.server.trim().is_empty() {
+            (theme::WEAK, "No server")
+        } else if self.info.is_some() {
+            (theme::GREEN, "Online")
+        } else if self.busy() == Some(Job::Check) {
+            (theme::BLUE, "Connecting…")
+        } else {
+            (theme::RED, "Offline")
+        }
+    }
+
+    fn header_ui(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        theme::gradient(painter, rect, Color32::from_rgb(0x13, 0x2c, 0x63), Color32::from_rgb(0x1d, 0x15, 0x40));
+        // a LEGO-coloured stripe along the bottom
+        let third = rect.width() / 3.0;
+        for (i, c) in [theme::ACCENT, theme::RED, theme::BLUE].into_iter().enumerate() {
+            let r = Rect::from_min_size(pos2(rect.left() + third * i as f32, rect.bottom() - 3.0), vec2(third + 1.0, 3.0));
+            painter.rect_filled(r, 0, c);
+        }
+        let content = rect.shrink2(vec2(20.0, 0.0)).with_max_y(rect.bottom() - 3.0);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(Layout::left_to_right(Align::Center)), |ui| {
+            let (logo, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
+            theme::brick(ui.painter(), logo);
+            ui.add_space(8.0);
+            // Title and subtitle centred on the logo, painted (a vertical layout would sit at the top).
+            let sub = match &self.info {
+                Some(i) => format!("LMOxide Patcher  ·  {}", i.name),
+                None => "LMOxide Patcher".into(),
+            };
+            // Leave room for the chip and the settings button.
+            let room = (ui.available_width() - 170.0).max(40.0);
+            let line = |text: String, font: egui::FontId, color: Color32| {
+                let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
+                job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
+            let title = line("Minifigures Online".into(), egui::FontId::new(24.0, theme::display()), theme::TEXT);
+            let sub = line(sub, egui::FontId::proportional(14.0), Color32::from_rgb(0xa9, 0xb6, 0xd8));
+            let (text, _) = ui.allocate_exact_size(vec2(title.size().x.max(sub.size().x), 46.0), Sense::hover());
+            let top = text.center().y - (title.size().y + sub.size().y) / 2.0;
+            ui.painter().galley(pos2(text.left(), top), title.clone(), theme::TEXT);
+            ui.painter().galley(pos2(text.left(), top + title.size().y), sub, theme::TEXT);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
+                    self.show_settings = true;
+                }
+                ui.add_space(4.0);
+                let (color, text) = self.connection();
+                let chip = theme::chip(ui, color, text);
+                if let Some(e) = self.error.as_deref().filter(|_| self.info.is_none()) {
+                    chip.on_hover_text(e);
                 }
             });
-            ui.end_row();
-
-            ui.label("Install to");
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut self.settings.dir);
-                let r = ui.add_enabled(idle, edit.desired_width(ui.available_width() - 80.0));
-                changed |= r.lost_focus();
-                if ui.add_enabled(idle, egui::Button::new("Browse…")).clicked() {
-                    self.browse();
-                }
-            });
-            ui.end_row();
-
-            ui.label("Client");
-            ui.add_enabled_ui(idle, |ui| {
-                let before = self.settings.platform;
-                egui::ComboBox::from_id_salt("platform").selected_text(platform_name(before)).show_ui(ui, |ui| {
-                    for p in Platform::ALL {
-                        ui.selectable_value(&mut self.settings.platform, p, platform_name(p));
-                    }
-                });
-                changed |= before != self.settings.platform;
-            });
-            ui.end_row();
         });
+    }
+
+    /// The status headline: icon, colour, title and a detail line.
+    fn headline(&self) -> (&'static str, Color32, String, String) {
+        let summary = self.installed.as_ref().map(|m| {
+            let version: String = m.version.chars().take(8).collect();
+            format!("{} client  ·  version {version}", platform_name(m.platform))
+        });
+        let summary = || summary.clone().unwrap_or_default();
+        match (self.busy(), &self.status) {
+            (Some(Job::Sync { full }), _) => {
+                let title = if full {
+                    "Repairing…"
+                } else if self.installed.is_some() {
+                    "Updating…"
+                } else {
+                    "Installing…"
+                };
+                (icon::DOWNLOAD, theme::ACCENT, title.into(), self.run.describe())
+            }
+            (Some(Job::Verify { .. }), _) => (icon::SHIELD_CHECK, theme::BLUE, "Verifying…".into(), self.run.describe()),
+            (_, Some(Status::Indexing)) => (
+                icon::HOURGLASS,
+                theme::AMBER,
+                "Server is getting ready".into(),
+                "It's still indexing its client files. This updates by itself when it's done.".into(),
+            ),
+            (Some(Job::Check), None) => {
+                (icon::PULSE, theme::BLUE, "Checking for updates…".into(), self.settings.server.trim().into())
+            }
+            (_, Some(Status::UpToDate)) => (icon::CHECK_CIRCLE, theme::GREEN, "Ready to play".into(), summary()),
+            (_, Some(Status::UpdateAvailable)) => {
+                (icon::CLOUD_DOWN, theme::ACCENT, "Update available".into(), format!("{}  ·  update to play", summary()))
+            }
+            (_, Some(Status::NotInstalled { bytes })) => (
+                icon::CLOUD_DOWN,
+                theme::ACCENT,
+                "Not installed yet".into(),
+                format!("{} to download  ·  {} client", human_bytes(*bytes), platform_name(self.settings.platform)),
+            ),
+            (_, Some(Status::KeyChanged)) => (
+                icon::WARNING,
+                theme::RED,
+                "The server's key changed".into(),
+                "Its files are signed with a different key. Update to review it.".into(),
+            ),
+            (None, None) if self.settings.server.trim().is_empty() => (
+                icon::GLOBE,
+                theme::WEAK,
+                "Choose a server".into(),
+                "Enter the patch server's address under Installation.".into(),
+            ),
+            (None, None) if self.installed.is_some() => (
+                icon::PLUGS,
+                theme::AMBER,
+                "Can't check for updates".into(),
+                "The server isn't reachable. You can still play the installed client.".into(),
+            ),
+            (None, None) => (icon::PLUGS, theme::RED, "Server unreachable".into(), "Check the address and try again.".into()),
+        }
+    }
+
+    fn status_ui(&mut self, ui: &mut egui::Ui) {
+        let (badge, color, title, detail) = self.headline();
+        ui.horizontal(|ui| {
+            theme::badge(ui, badge, color);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.add_space(3.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(title).family(theme::display()).size(23.0).color(theme::TEXT));
+                ui.add(egui::Label::new(RichText::new(detail).color(theme::WEAK)).truncate());
+            });
+        });
+        if let Some(e) = &self.error {
+            ui.add_space(4.0);
+            theme::callout(ui, icon::WARNING_CIRCLE, theme::RED, e);
+        }
+        if self.working() {
+            ui.add_space(8.0);
+            self.progress_ui(ui, color);
+        }
+        ui.add_space(12.0);
+        self.actions_ui(ui);
+    }
+
+    fn progress_ui(&mut self, ui: &mut egui::Ui, color: Color32) {
+        let r = &mut self.run;
+        theme::progress(ui, r.fraction(), color);
+        if !matches!(r.stage, Stage::Downloading) {
+            return;
+        }
+        r.sample();
+        let rate = r.rate();
+        let stat = |ui: &mut egui::Ui, label: &str, value: String| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new(label.to_uppercase()).size(10.5).color(theme::WEAK).extra_letter_spacing(0.8));
+                ui.label(RichText::new(value).family(theme::semibold()).size(14.5).color(theme::TEXT));
+            });
+            ui.add_space(18.0);
+        };
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            stat(ui, "Downloaded", format!("{} / {}", human_bytes(r.done_bytes), human_bytes(r.total_bytes)));
+            stat(ui, "Speed", rate.map_or("–".into(), |v| format!("{}/s", human_bytes(v as u64))));
+            let left = rate.filter(|v| *v > 0.0).map(|v| r.total_bytes.saturating_sub(r.done_bytes) as f64 / v);
+            stat(ui, "Time left", left.map_or("–".into(), human_duration));
+            stat(ui, "Files", format!("{} / {}", r.files_done, r.files_total));
+        });
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for p in r.current.iter().take(3) {
+            ui.add(egui::Label::new(RichText::new(p).monospace().size(11.5).color(theme::WEAK)).truncate());
+        }
+    }
+
+    fn actions_ui(&mut self, ui: &mut egui::Ui) {
+        let working = self.working();
+        let has_server = !self.settings.server.trim().is_empty();
+        let installed = self.installed.is_some();
+        let needs_sync =
+            matches!(self.status, Some(Status::NotInstalled { .. } | Status::UpdateAvailable | Status::KeyChanged));
+        let sync_label = if installed { "Update" } else { "Install" };
+        let sync_icon = if installed { icon::UPDATE } else { icon::DOWNLOAD };
+        let big = vec2(200.0_f32.min(ui.available_width() * 0.45), 46.0);
+        let small = vec2(104.0, 34.0);
+        // Enter outside a text field (and outside a dialog) presses the yellow button.
+        let enter = !self.show_settings
+            && self.trust.is_none()
+            && ui.memory(|m| m.focused().is_none())
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        ui.horizontal(|ui| {
+            if working {
+                if theme::big_button(ui, Kind::Danger, icon::X, "Cancel", true, big).clicked() {
+                    self.cancel();
+                }
+            } else if needs_sync || !installed {
+                if theme::big_button(ui, Kind::Primary, sync_icon, sync_label, has_server, big).clicked() || (enter && has_server) {
+                    self.start(Job::Sync { full: false }, None);
+                }
+                if installed && theme::big_button(ui, Kind::Secondary, icon::PLAY, "Play", true, big).clicked() {
+                    self.play();
+                }
+            } else if theme::big_button(ui, Kind::Primary, icon::PLAY, "Play", true, big).clicked() || enter {
+                self.play();
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let enabled = !working && has_server && installed;
+                if theme::big_button(ui, Kind::Secondary, icon::WRENCH, "Repair", enabled, small)
+                    .on_hover_text("Rehash every file and download whatever differs (slow, for damaged installs)")
+                    .clicked()
+                {
+                    self.start(Job::Sync { full: true }, None);
+                }
+                if theme::big_button(ui, Kind::Secondary, icon::SHIELD_CHECK, "Verify", enabled, small)
+                    .on_hover_text("Compare the install with the server's files; change nothing")
+                    .clicked()
+                {
+                    self.start(Job::Verify { full: false }, None);
+                }
+            });
+        });
+    }
+
+    fn account_ui(&mut self, ui: &mut egui::Ui) {
+        theme::card_title(ui, icon::USER, "Account");
+        theme::field_label(ui, "Username");
+        ui.add(theme::text_field(&mut self.settings.username).hint_text("Optional").desired_width(f32::INFINITY));
+        theme::field_label(ui, "Password");
+        let r = ui.add(theme::text_field(&mut self.password).password(true).desired_width(f32::INFINITY));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.installed.is_some() {
+            self.play();
+        }
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new("With a username, Play logs you in automatically. The password is never saved.")
+                    .size(12.0)
+                    .color(theme::WEAK),
+            )
+            .wrap(),
+        );
+    }
+
+    fn installation_ui(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.working();
+        let mut changed = false;
+        theme::card_title(ui, icon::CUBE, "Installation");
+
+        theme::field_label(ui, "Patch server");
+        ui.horizontal(|ui| {
+            let edit = theme::text_field(&mut self.settings.server)
+                .hint_text("http://lmo.example.org:8080")
+                .desired_width(ui.available_width() - 42.0);
+            let r = ui.add_enabled(idle, edit);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let connect = ui.add_enabled_ui(idle, |ui| theme::icon_button(ui, icon::UPDATE, "Connect")).inner;
+            changed |= connect.clicked() || enter;
+        });
+
+        theme::field_label(ui, "Install folder");
+        ui.horizontal(|ui| {
+            let edit = theme::text_field(&mut self.settings.dir).desired_width(ui.available_width() - 42.0);
+            let r = ui.add_enabled(idle, edit);
+            self.dir_edited |= r.changed();
+            changed |= r.lost_focus() && self.dir_edited;
+            if ui.add_enabled_ui(idle, |ui| theme::icon_button(ui, icon::FOLDER, "Browse…")).inner.clicked() {
+                self.browse();
+            }
+        });
+
+        theme::field_label(ui, "Client");
+        let options: Vec<_> = Platform::ALL
+            .into_iter()
+            .map(|p| (p, if p == Platform::Windows { icon::WINDOWS } else { icon::LINUX }, platform_name(p)))
+            .collect();
+        changed |= theme::segmented(ui, &mut self.settings.platform, &options, idle);
+
         if changed {
             self.location_changed();
         }
@@ -340,12 +640,16 @@ impl PatcherApp {
 
     fn server_ui(&mut self, ui: &mut egui::Ui) {
         let Some(info) = &self.info else { return };
-        egui::CollapsingHeader::new(format!("Server: {}", info.name)).id_salt("server").show(ui, |ui| {
-            egui::Grid::new("info").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Game server");
-                ui.monospace(&info.universe_addr);
+        theme::card(ui, |ui| {
+            theme::card_title(ui, icon::SERVER, &format!("Server  ·  {}", info.name));
+            egui::Grid::new("info").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                let key = |ui: &mut egui::Ui, k: &str| {
+                    ui.label(RichText::new(k).color(theme::WEAK));
+                };
+                key(ui, "Game server");
+                ui.label(RichText::new(&info.universe_addr).monospace());
                 ui.end_row();
-                ui.label("Clients");
+                key(ui, "Clients");
                 let platforms: Vec<String> = info
                     .platforms
                     .iter()
@@ -353,242 +657,163 @@ impl PatcherApp {
                     .collect();
                 ui.label(platforms.join(", "));
                 ui.end_row();
-                ui.label("Signing key");
-                ui.monospace(&info.manifest_key).on_hover_text("ed25519 key the server signs its manifests with");
+                key(ui, "Signing key");
+                let short = format!("{}…{}", &info.manifest_key[..12.min(info.manifest_key.len())], &info.manifest_key[info.manifest_key.len().saturating_sub(8)..]);
+                ui.label(RichText::new(short).monospace())
+                    .on_hover_text(format!("ed25519 key the server signs its file lists with:\n{}", group_hex(&info.manifest_key)));
                 ui.end_row();
-                ui.label("Login key");
-                ui.label(if info.login_public_key.is_some() { "patched into the client" } else { "none (client unpatched)" });
+                key(ui, "Login key");
+                ui.label(if info.login_public_key.is_some() { "Patched into the client" } else { "None (the client can't log in)" });
                 ui.end_row();
             });
             for w in &info.warnings {
-                ui.colored_label(ui.visuals().warn_fg_color, w);
-            }
-        });
-    }
-
-    fn status_ui(&mut self, ui: &mut egui::Ui) {
-        let (text, color) = match (self.busy(), &self.status) {
-            (Some(Job::Sync { .. }), _) => (if self.installed.is_some() { "Updating…" } else { "Installing…" }.into(), None),
-            (Some(Job::Verify { .. }), _) => ("Verifying…".into(), None),
-            (_, Some(Status::Indexing)) => ("The server is still preparing its client files…".into(), None),
-            (Some(Job::Check), None) => ("Checking the server…".into(), None),
-            (_, Some(Status::UpToDate)) => ("Up to date".into(), Some(Color32::from_rgb(0x3c, 0xb3, 0x71))),
-            (_, Some(Status::UpdateAvailable)) => ("Update available".into(), Some(ui.visuals().warn_fg_color)),
-            (_, Some(Status::NotInstalled { bytes })) => {
-                (format!("Not installed ({} to download)", human_bytes(*bytes)), None)
-            }
-            (_, Some(Status::KeyChanged)) => {
-                ("The server's signing key changed".into(), Some(ui.visuals().error_fg_color))
-            }
-            (None, None) if self.settings.server.trim().is_empty() => ("Enter the patch server's address".into(), None),
-            (None, None) if self.installed.is_some() => ("Installed (server not reachable)".into(), None),
-            (None, None) => ("Server not reachable".into(), None),
-        };
-        let mut text = RichText::new(text).size(20.0).strong();
-        if let Some(c) = color {
-            text = text.color(c);
-        }
-        ui.label(text);
-        if let Some(m) = &self.installed {
-            ui.weak(format!("{} client from {}", platform_name(m.platform), m.server));
-        }
-    }
-
-    fn progress_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(job) = self.busy() else { return };
-        if job == Job::Check {
-            return;
-        }
-        let r = &mut self.run;
-        match r.stage {
-            Stage::Connecting => {
-                ui.add(egui::ProgressBar::new(0.0).animate(true).text("Fetching the manifest…"));
-            }
-            Stage::Waiting => {
-                ui.add(egui::ProgressBar::new(0.0).animate(true).text("Waiting for the server to finish indexing…"));
-            }
-            Stage::Checking { done, total } => {
-                let f = if total == 0 { 1.0 } else { done as f32 / total as f32 };
-                ui.add(egui::ProgressBar::new(f).text(format!("Checking files: {done} / {total}")));
-            }
-            Stage::Downloading => {
-                r.sample();
-                let f = if r.total_bytes == 0 { 1.0 } else { r.done_bytes as f32 / r.total_bytes as f32 };
-                let mut text = format!("{} / {}", human_bytes(r.done_bytes), human_bytes(r.total_bytes));
-                if let Some(rate) = r.rate() {
-                    text += &format!("  ·  {}/s", human_bytes(rate as u64));
-                    if rate > 0.0 {
-                        let left = r.total_bytes.saturating_sub(r.done_bytes) as f64 / rate;
-                        text += &format!("  ·  {} left", human_duration(left));
-                    }
-                }
-                ui.add(egui::ProgressBar::new(f).text(text));
-                ui.weak(format!("files: {} / {}", r.files_done, r.files_total));
-                for p in r.current.iter().take(4) {
-                    ui.add(egui::Label::new(RichText::new(p).monospace().weak()).truncate());
-                }
-            }
-        }
-    }
-
-    fn actions_ui(&mut self, ui: &mut egui::Ui) {
-        let busy = self.busy();
-        let working = matches!(busy, Some(Job::Sync { .. } | Job::Verify { .. }));
-        let has_server = !self.settings.server.trim().is_empty();
-        let big = |s: &str| egui::Button::new(RichText::new(s).size(17.0)).min_size(egui::vec2(130.0, 34.0));
-
-        ui.horizontal(|ui| {
-            if working {
-                if ui.add(big("Cancel")).clicked() {
-                    self.cancel();
-                }
-            } else {
-                let label = if self.installed.is_some() { "Update" } else { "Install" };
-                let needed = matches!(
-                    self.status,
-                    Some(Status::NotInstalled { .. } | Status::UpdateAvailable | Status::KeyChanged)
-                );
-                let mut b = big(label);
-                if needed {
-                    b = b.fill(ui.visuals().selection.bg_fill);
-                }
-                if ui.add_enabled(has_server, b).clicked() {
-                    self.start(Job::Sync { full: false }, None);
-                }
-            }
-            let can_play = self.installed.is_some() && !matches!(busy, Some(Job::Sync { .. }));
-            let mut play = big("Play");
-            if can_play && matches!(self.status, Some(Status::UpToDate)) {
-                play = play.fill(ui.visuals().selection.bg_fill);
-            }
-            if ui.add_enabled(can_play, play).clicked() {
-                self.play();
-            }
-            ui.add_space(8.0);
-            ui.add_enabled_ui(!working && has_server, |ui| {
-                if ui.button("Verify").on_hover_text("Compare the install with the server's files; change nothing").clicked() {
-                    self.start(Job::Verify { full: false }, None);
-                }
-                if ui
-                    .button("Repair")
-                    .on_hover_text("Rehash every file and download whatever differs (slow, for damaged installs)")
-                    .clicked()
-                {
-                    self.start(Job::Sync { full: true }, None);
-                }
-            });
-        });
-    }
-
-    fn login_ui(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("login").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Username");
-            ui.add(egui::TextEdit::singleline(&mut self.settings.username).hint_text("optional: log in automatically"));
-            ui.end_row();
-            ui.label("Password");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.installed.is_some() {
-                self.play();
-            }
-            ui.end_row();
-        });
-    }
-
-    fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Settings").id_salt("settings").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Parallel downloads");
-                ui.add(egui::DragValue::new(&mut self.settings.jobs).range(1..=16));
-            });
-            if !cfg!(windows) {
-                ui.horizontal(|ui| {
-                    ui.label("Run the Windows client with");
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.windows_runner).hint_text("wine").desired_width(160.0));
-                });
+                ui.add_space(2.0);
+                theme::callout(ui, icon::WARNING, theme::AMBER, w);
             }
         });
     }
 
     fn verified_ui(&mut self, ui: &mut egui::Ui) {
         let Some(plan) = &self.verified else { return };
-        if plan.is_up_to_date() {
-            return;
-        }
-        let n = plan.download.len() + plan.fix_mode.len() + plan.remove.len();
-        egui::CollapsingHeader::new(format!("Verify found {n} differences ({} to download)", human_bytes(plan.download_bytes())))
-            .id_salt("verified")
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, what: &str, path: &str| {
-                        ui.horizontal(|ui| {
-                            ui.add_sized([60.0, 14.0], egui::Label::new(RichText::new(what).weak()));
-                            ui.monospace(path);
-                        });
-                    };
-                    for c in &plan.download {
-                        row(ui, if c.reason == Reason::Missing { "missing" } else { "changed" }, &c.entry.path);
+        theme::card(ui, |ui| {
+            if plan.is_up_to_date() {
+                theme::card_title(ui, icon::SHIELD_CHECK, "Verify");
+                theme::callout(ui, icon::CHECK_CIRCLE, theme::GREEN, &format!("All {} files are intact.", plan.unchanged));
+                return;
+            }
+            let n = plan.download.len() + plan.fix_mode.len() + plan.remove.len();
+            theme::card_title(ui, icon::SHIELD_CHECK, &format!("Verify found {n} differences"));
+            ui.label(
+                RichText::new(format!("Update or Repair fixes them ({} to download).", human_bytes(plan.download_bytes())))
+                    .color(theme::WEAK),
+            );
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                let row = |ui: &mut egui::Ui, what: &str, color: Color32, path: &str| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([64.0, 16.0], egui::Label::new(RichText::new(what).size(12.0).color(color)));
+                        ui.add(egui::Label::new(RichText::new(path).monospace()).truncate());
+                    });
+                };
+                for c in &plan.download {
+                    if c.reason == Reason::Missing {
+                        row(ui, "missing", theme::RED, &c.entry.path);
+                    } else {
+                        row(ui, "changed", theme::AMBER, &c.entry.path);
                     }
-                    for e in &plan.fix_mode {
-                        row(ui, "mode", &e.path);
-                    }
-                    for r in &plan.remove {
-                        row(ui, "remove", r);
-                    }
-                });
+                }
+                for e in &plan.fix_mode {
+                    row(ui, "mode", theme::BLUE, &e.path);
+                }
+                for r in &plan.remove {
+                    row(ui, "remove", theme::WEAK, r);
+                }
             });
+        });
     }
 
     fn log_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let caret = if self.settings.show_log { icon::CARET_DOWN } else { icon::CARET_UP };
+            let toggle = ui
+                .add(egui::Button::new(RichText::new(format!("{}  Activity  {caret}", icon::LIST)).family(theme::semibold()).color(theme::WEAK)).frame_when_inactive(false))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if toggle.clicked() {
+                self.settings.show_log = !self.settings.show_log;
+            }
+            if let Some((level, line)) = self.log.back().filter(|_| !self.settings.show_log) {
+                ui.add(egui::Label::new(RichText::new(line).size(12.0).color(level_color(*level))).truncate());
+            }
+        });
+        if !self.settings.show_log {
+            return;
+        }
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            if self.log.is_empty() {
+                ui.label(RichText::new("Nothing yet.").color(theme::WEAK));
+            }
             for (level, line) in &self.log {
-                let color = match level {
-                    Level::Info => ui.visuals().weak_text_color(),
-                    Level::Warn => ui.visuals().warn_fg_color,
-                    Level::Error => ui.visuals().error_fg_color,
-                };
-                ui.label(RichText::new(line).color(color).monospace());
+                ui.label(RichText::new(line).color(level_color(*level)).monospace());
             }
         });
     }
 
-    fn trust_ui(&mut self, ctx: &egui::Context) {
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::unique("settings")).frame(dialog_frame()).show(ctx, |ui| {
+            ui.set_width(380.0_f32.min(ctx.content_rect().width() - 80.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::GEAR).size(20.0).color(theme::ACCENT));
+                ui.label(RichText::new("Settings").family(theme::display()).size(20.0));
+            });
+            ui.add_space(6.0);
+            theme::field_label(ui, "Parallel downloads");
+            ui.add(egui::Slider::new(&mut self.settings.jobs, 1..=16));
+            if !cfg!(windows) {
+                theme::field_label(ui, "Run the Windows client with");
+                ui.add(theme::text_field(&mut self.settings.windows_runner).hint_text("wine").desired_width(f32::INFINITY));
+                ui.label(RichText::new("For example wine, or a Proton wrapper. Empty starts LMO.exe directly.").size(12.0).color(theme::WEAK));
+            }
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                theme::big_button(ui, Kind::Primary, "", "Done", true, vec2(96.0, 34.0)).clicked()
+            })
+            .inner
+        });
+        if modal.inner || modal.should_close() {
+            self.show_settings = false;
+        }
+    }
+
+    fn trust_window(&mut self, ctx: &egui::Context) {
         let Some(t) = &self.trust else { return };
         let mut decision = None;
-        egui::Modal::new(egui::Id::unique("trust")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            match &t.expected {
-                None => {
-                    ui.heading("Trust this server?");
-                    ui.label(
-                        "This is the first install from this server. Its files are signed with the key \
-                         below; later updates must be signed with the same key.",
-                    );
-                    ui.add_space(4.0);
-                    ui.monospace(group_hex(&t.got));
-                    ui.add_space(4.0);
-                    ui.weak("If the server's operator published its key, check that it matches.");
-                }
-                Some(expected) => {
-                    ui.heading(RichText::new("The server's signing key changed!").color(ui.visuals().error_fg_color));
-                    ui.label(
-                        "The files are signed with a different key than the one this install trusts. \
-                         Only accept it if the server's operator says they changed the key; otherwise \
-                         someone may be serving altered files.",
-                    );
-                    ui.add_space(4.0);
-                    ui.label("Trusted:");
-                    ui.monospace(group_hex(expected));
-                    ui.label("Now:");
-                    ui.monospace(group_hex(&t.got));
-                }
-            }
-            ui.add_space(8.0);
+        egui::Modal::new(egui::Id::unique("trust")).frame(dialog_frame()).show(ctx, |ui| {
+            ui.set_width(440.0_f32.min(ctx.content_rect().width() - 80.0));
+            let changed = t.expected.is_some();
             ui.horizontal(|ui| {
-                let accept = if t.expected.is_none() { "Trust and continue" } else { "Accept the new key" };
-                if ui.button(accept).clicked() {
+                if changed {
+                    theme::badge(ui, icon::WARNING, theme::RED);
+                } else {
+                    theme::badge(ui, icon::KEY, theme::ACCENT);
+                }
+                ui.add_space(4.0);
+                let title = if changed { "The server's key changed" } else { "Trust this server?" };
+                ui.label(RichText::new(title).family(theme::display()).size(21.0));
+            });
+            ui.add_space(6.0);
+            let body = if changed {
+                "Its files are signed with a different key than the one this install trusts. Only accept \
+                 it if the server's operator says they changed the key; otherwise someone may be serving \
+                 altered files."
+            } else {
+                "This is the first install from this server. Its files are signed with the key below, and \
+                 every later update must be signed with the same key."
+            };
+            ui.add(egui::Label::new(body).wrap());
+            ui.add_space(6.0);
+            let key_box = |ui: &mut egui::Ui, label: &str, key: &str, color: Color32| {
+                theme::field_label(ui, label);
+                egui::Frame::new().fill(theme::FIELD).corner_radius(8).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(group_hex(key)).monospace().size(13.0).color(color));
+                });
+            };
+            if let Some(expected) = &t.expected {
+                key_box(ui, "Trusted until now", expected, theme::WEAK);
+                key_box(ui, "Now signed with", &t.got, theme::RED);
+            } else {
+                key_box(ui, "Signing key", &t.got, theme::TEXT);
+                ui.label(RichText::new("If the operator published its key, check that it matches.").size(12.0).color(theme::WEAK));
+            }
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (kind, accept) = if changed { (Kind::Danger, "Accept the new key") } else { (Kind::Primary, "Trust and continue") };
+                if theme::big_button(ui, kind, icon::KEY, accept, true, vec2(190.0, 38.0)).clicked() {
                     decision = Some(true);
                 }
-                if ui.button("Cancel").clicked() {
+                if theme::big_button(ui, Kind::Secondary, "", "Cancel", true, vec2(96.0, 38.0)).clicked() {
                     decision = Some(false);
                 }
             });
@@ -605,41 +830,70 @@ impl PatcherApp {
 impl eframe::App for PatcherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
-        if matches!(self.busy(), Some(Job::Sync { .. } | Job::Verify { .. })) {
+        if self.working() {
             // Keep the rate and ETA moving between progress messages.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
+        } else if let Some(t) = self.recheck_at {
+            ui.ctx().request_repaint_after(t.saturating_duration_since(Instant::now()));
         }
-        egui::Panel::bottom("log").resizable(true).default_size(110.0).show(ui, |ui| {
-            ui.add_space(4.0);
-            self.log_ui(ui);
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(4.0);
-                self.location_ui(ui);
-                self.server_ui(ui);
-                ui.separator();
-                self.status_ui(ui);
-                ui.add_space(4.0);
-                self.progress_ui(ui);
-                ui.add_space(6.0);
-                self.actions_ui(ui);
+
+        egui::Panel::top("header").frame(egui::Frame::NONE).exact_size(84.0).show(ui, |ui| self.header_ui(ui));
+
+        let log_frame = egui::Frame::new()
+            .fill(Color32::from_rgb(0x0a, 0x0c, 0x11))
+            .inner_margin(Margin::symmetric(16, 8))
+            .stroke(egui::Stroke::new(1.0, theme::CARD_STROKE));
+        let log_panel = if self.settings.show_log {
+            egui::Panel::bottom("log-open").resizable(true).default_size(150.0).min_size(80.0)
+        } else {
+            egui::Panel::bottom("log-closed").resizable(false).exact_size(38.0)
+        };
+        log_panel.frame(log_frame).show(ui, |ui| self.log_ui(ui));
+
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(18))).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.0;
+                theme::card(ui, |ui| self.status_ui(ui));
                 self.verified_ui(ui);
-                ui.add_space(6.0);
-                ui.separator();
-                self.login_ui(ui);
-                ui.add_space(4.0);
-                self.settings_ui(ui);
+                if ui.available_width() >= 600.0 {
+                    ui.columns(2, |cols| {
+                        theme::card(&mut cols[0], |ui| self.account_ui(ui));
+                        theme::card(&mut cols[1], |ui| self.installation_ui(ui));
+                    });
+                } else {
+                    theme::card(ui, |ui| self.installation_ui(ui));
+                    theme::card(ui, |ui| self.account_ui(ui));
+                }
+                self.server_ui(ui);
             });
         });
+
         let ctx = ui.ctx().clone();
-        self.trust_ui(&ctx);
+        self.settings_window(&ctx);
+        self.trust_window(&ctx);
         #[cfg(debug_assertions)]
         dev_screenshot(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+}
+
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(egui::Stroke::new(1.0, theme::CARD_STROKE))
+        .corner_radius(16)
+        .inner_margin(24)
+        .shadow(egui::Shadow { offset: [0, 10], blur: 40, spread: 0, color: Color32::from_black_alpha(160) })
+}
+
+fn level_color(level: Level) -> Color32 {
+    match level {
+        Level::Info => theme::WEAK,
+        Level::Warn => theme::AMBER,
+        Level::Error => theme::RED,
     }
 }
 

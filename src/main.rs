@@ -7,6 +7,7 @@
 mod app;
 mod install;
 mod settings;
+mod theme;
 mod worker;
 
 fn main() -> eframe::Result {
@@ -19,8 +20,9 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_app_id("lmoxide-patcher")
             .with_title("LMOxide Patcher")
-            .with_inner_size([640.0, 560.0])
-            .with_min_inner_size([480.0, 420.0]),
+            .with_icon(theme::window_icon())
+            .with_inner_size([760.0, 720.0])
+            .with_min_inner_size([520.0, 520.0]),
         // Debug screenshots (app.rs) of a window on a hidden workspace: under X11 without
         // vsync it keeps drawing (Wayland paces by frame callbacks, which hidden windows lack).
         glow_options: eframe::egui_glow::GlowConfiguration {

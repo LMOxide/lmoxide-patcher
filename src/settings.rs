@@ -21,6 +21,8 @@ pub struct Settings {
     /// Command the Windows client is started with on other systems (e.g. `wine`); empty runs
     /// `LMO.exe` directly.
     pub windows_runner: String,
+    /// The activity log is expanded.
+    pub show_log: bool,
 }
 
 impl Default for Settings {
@@ -32,6 +34,7 @@ impl Default for Settings {
             jobs: 4,
             username: String::new(),
             windows_runner: if cfg!(windows) { String::new() } else { "wine".into() },
+            show_log: false,
         }
     }
 }

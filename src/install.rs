@@ -81,10 +81,10 @@ mod tests {
 
     fn output(dir: &Path) -> String {
         for _ in 0..50 {
-            if let Ok(s) = std::fs::read_to_string(dir.join("out.txt")) {
-                if s.ends_with('\n') {
-                    return s;
-                }
+            if let Ok(s) = std::fs::read_to_string(dir.join("out.txt"))
+                && s.ends_with('\n')
+            {
+                return s;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
