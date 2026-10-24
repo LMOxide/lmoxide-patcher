@@ -136,7 +136,12 @@ pub async fn run(req: Request, out: Outbox) {
 
 fn describe(client: &Client, platform: Platform, e: Error) -> String {
     match e {
-        Error::Status { status: 404, .. } => format!("{} doesn't offer a {platform} client", client.base_url()),
+        Error::Status { status: 404, url } if url.contains("/manifest/") => {
+            format!("{} doesn't offer a {platform} client", client.base_url())
+        }
+        Error::Status { status: 404, url } if url.contains("/files/") => {
+            format!("{} is missing one of its client files ({url}); ask its admin to restart it", client.base_url())
+        }
         e => e.to_string(),
     }
 }

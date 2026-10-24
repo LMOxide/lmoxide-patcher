@@ -53,6 +53,9 @@ pub struct PatcherApp {
     recheck_at: Option<Instant>,
     /// The verified manifest of the current install (for Play).
     installed: Option<Manifest>,
+    /// No patcher install, but the client is already in the folder (copied in or set up some
+    /// other way): installing just checks it and downloads what differs.
+    existing: bool,
     password: String,
     /// The install directory was edited and not yet checked.
     dir_edited: bool,
@@ -169,6 +172,7 @@ impl PatcherApp {
             error: None,
             recheck_at: None,
             installed: None,
+            existing: false,
             password: String::new(),
             dir_edited: false,
             show_settings: false,
@@ -207,7 +211,9 @@ impl PatcherApp {
 
     /// Server, directory or platform changed: forget what we knew and check again.
     fn location_changed(&mut self) {
-        self.installed = worker::installed(&self.dir(), self.settings.profile().platform);
+        let platform = self.settings.profile().platform;
+        self.installed = worker::installed(&self.dir(), platform);
+        self.existing = self.installed.is_none() && self.dir().join(executable_name(platform)).is_file();
         self.info = None;
         self.game = None;
         self.status = None;
@@ -545,7 +551,7 @@ impl PatcherApp {
             (Some(Job::Sync { full }), _) => {
                 let title = if full {
                     "Repairing…"
-                } else if self.installed.is_some() {
+                } else if self.installed.is_some() || self.existing {
                     "Updating…"
                 } else {
                     "Installing…"
@@ -566,6 +572,15 @@ impl PatcherApp {
             (_, Some(Status::UpdateAvailable)) => {
                 (icon::CLOUD_DOWN, theme::ACCENT, "Update available".into(), format!("{}  ·  update to play", summary()))
             }
+            (_, Some(Status::NotInstalled { .. })) if self.existing => (
+                icon::FOLDER,
+                theme::ACCENT,
+                "Existing install found".into(),
+                format!(
+                    "Update checks its files and downloads only what differs  ·  {} client",
+                    platform_name(self.settings.profile().platform)
+                ),
+            ),
             (_, Some(Status::NotInstalled { bytes })) => (
                 icon::CLOUD_DOWN,
                 theme::ACCENT,
@@ -654,8 +669,8 @@ impl PatcherApp {
         let installed = self.installed.is_some();
         let needs_sync =
             matches!(self.status, Some(Status::NotInstalled { .. } | Status::UpdateAvailable | Status::KeyChanged));
-        let sync_label = if installed { "Update" } else { "Install" };
-        let sync_icon = if installed { icon::UPDATE } else { icon::DOWNLOAD };
+        let sync_label = if installed || self.existing { "Update" } else { "Install" };
+        let sync_icon = if installed || self.existing { icon::UPDATE } else { icon::DOWNLOAD };
         let big = vec2(200.0_f32.min(ui.available_width() * 0.45), 46.0);
         let small = vec2(104.0, 34.0);
         // Enter outside a text field (and outside a dialog) presses the yellow button.
@@ -1203,6 +1218,14 @@ fn dev_screenshot(ctx: &egui::Context) {
         ppm.extend(image.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]));
         let _ = std::fs::write(dir.join(format!("shot-{n}.ppm")), ppm);
     })));
+}
+
+/// The client's executable, whose presence marks an install the patcher didn't make.
+fn executable_name(p: Platform) -> &'static str {
+    match p {
+        Platform::Windows => "LMO.exe",
+        Platform::Linux => "LMO",
+    }
 }
 
 fn platform_name(p: Platform) -> &'static str {
