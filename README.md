@@ -39,7 +39,7 @@ patcher library comes from it by path.
 ```
 lego-minifigures-online/
 ├── lmoxide/                 # server monorepo (crates/lmoxide-patch)
-└── lmoxide-patcher-gui/     # this repo
+└── lmoxide-patcher/         # this repo
 ```
 
 ```sh
