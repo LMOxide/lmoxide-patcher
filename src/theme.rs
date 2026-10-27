@@ -1,10 +1,10 @@
 //! Look and feel: colours, fonts, and the few widgets drawn by hand (buttons, progress bar,
-//! cards, the brick logo).
+//! cards) and the logo.
 
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Pos2, Rect,
+    self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Rect,
     Response, RichText, Sense, Shadow, Stroke, StrokeKind, TextStyle, Ui, Vec2, WidgetInfo, epaint::Mesh,
     pos2, vec2,
 };
@@ -145,61 +145,26 @@ pub fn install(ctx: &egui::Context) {
     });
 }
 
-/// The window icon: the brick logo.
+/// The LMOxide logo (a copy of `lmoxide/assets/logo/lmoxide-256.png`).
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo-256.png");
+
+/// The window icon: the logo.
 pub fn window_icon() -> egui::IconData {
-    const N: usize = 64;
-    // 4×4 supersampling of the same shapes `brick` paints.
-    let mut rgba = vec![0u8; N * N * 4];
-    for y in 0..N {
-        for x in 0..N {
-            let (mut body, mut stud) = (0u32, 0u32);
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    let p = pos2((x as f32 + (sx as f32 + 0.5) / 4.0) / N as f32, (y as f32 + (sy as f32 + 0.5) / 4.0) / N as f32);
-                    match brick_shape(p) {
-                        Some(true) => stud += 1,
-                        Some(false) => body += 1,
-                        None => {}
-                    }
-                }
-            }
-            let a = (body + stud) as f32 / 16.0;
-            let t = if body + stud == 0 { 0.0 } else { stud as f32 / (body + stud) as f32 };
-            let (dark, light) = (ACCENT, rgb(0xff, 0xe0, 0x7a));
-            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-            let i = (y * N + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[mix(dark.r(), light.r()), mix(dark.g(), light.g()), mix(dark.b(), light.b()), (a * 255.0) as u8]);
-        }
-    }
-    egui::IconData { rgba, width: N as u32, height: N as u32 }
+    eframe::icon_data::from_png_bytes(LOGO_PNG).expect("the bundled logo is a valid PNG")
 }
 
-/// In the unit square: `Some(true)` on a stud, `Some(false)` on the body, `None` outside.
-fn brick_shape(p: Pos2) -> Option<bool> {
-    let body = Rect::from_min_max(pos2(0.06, 0.06), pos2(0.94, 0.94));
-    let r = 0.18;
-    let inner = body.shrink(r);
-    let d = vec2((p.x - p.x.clamp(inner.left(), inner.right())).abs(), (p.y - p.y.clamp(inner.top(), inner.bottom())).abs());
-    if d.length() > r {
-        return None;
-    }
-    let on_stud = [(0.32, 0.32), (0.68, 0.32), (0.32, 0.68), (0.68, 0.68)]
-        .iter()
-        .any(|&(cx, cy)| pos2(cx, cy).distance(p) < 0.13);
-    Some(on_stud)
-}
-
-/// The brick logo in `rect` (square).
-pub fn brick(painter: &egui::Painter, rect: Rect) {
-    let s = rect.width();
-    let body = Rect::from_min_max(rect.min + Vec2::splat(0.06 * s), rect.max - Vec2::splat(0.06 * s));
-    painter.rect_filled(body.translate(vec2(0.0, 0.04 * s)), 0.18 * s, Color32::from_black_alpha(90));
-    painter.rect_filled(body, 0.18 * s, ACCENT);
-    for (cx, cy) in [(0.32, 0.32), (0.68, 0.32), (0.32, 0.68), (0.68, 0.68)] {
-        let c = rect.min + vec2(cx, cy) * s;
-        painter.circle_filled(c + vec2(0.0, 0.025 * s), 0.13 * s, rgb(0xd9, 0xa3, 0x00));
-        painter.circle_filled(c, 0.13 * s, rgb(0xff, 0xdb, 0x5c));
-    }
+/// The logo in `rect` (square). Decoded and uploaded once, on first use.
+pub fn logo(painter: &egui::Painter, rect: Rect) {
+    let ctx = painter.ctx();
+    let id = egui::Id::unique("lmoxide-logo");
+    let texture = ctx.data_mut(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
+        let icon = window_icon();
+        let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+        let texture = ctx.load_texture("lmoxide-logo", image, egui::TextureOptions::LINEAR);
+        ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+        texture
+    });
+    painter.image(texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 }
 
 /// A horizontal gradient.

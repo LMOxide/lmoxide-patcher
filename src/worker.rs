@@ -98,6 +98,10 @@ pub enum Msg {
     /// A note for the activity log.
     Log(String),
     PickedDir(PathBuf),
+    /// A saved password, read from the credential store (`None`: none saved).
+    Password { server: String, username: String, result: Result<Option<String>, String> },
+    /// A password was saved (`true`) or forgotten (`false`).
+    PasswordStored { server: String, username: String, result: Result<bool, String> },
 }
 
 /// Sends messages to the window, tagged with the job they belong to (messages of a cancelled

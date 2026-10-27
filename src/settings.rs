@@ -1,5 +1,5 @@
 //! What the window remembers between runs (eframe's storage, `~/.local/share/lmoxide-patcher/`
-//! on Linux). Never the password.
+//! on Linux). Never a password: saved ones are in the system's credential store (`secrets.rs`).
 
 use std::collections::BTreeMap;
 
@@ -49,8 +49,10 @@ pub struct Profile {
     /// Install directory.
     pub dir: String,
     pub platform: Platform,
-    /// Remembered for automatic login.
+    /// The account Play logs in with (none: the client asks).
     pub username: String,
+    /// Accounts used with this profile, offered under the username.
+    pub accounts: Vec<Account>,
     /// Program (and arguments) the client is started with, e.g. `wine`, `proton run`,
     /// `gamemoderun`; empty starts it directly.
     pub runner: String,
@@ -86,11 +88,21 @@ impl Default for Profile {
             dir: lmoxide_patch::default_install_dir().map(|d| d.display().to_string()).unwrap_or_default(),
             platform,
             username: String::new(),
+            accounts: Vec::new(),
             runner: default_runner(platform).into(),
             args: String::new(),
             env: String::new(),
         }
     }
+}
+
+/// An account logged in with before.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Account {
+    pub username: String,
+    /// Its password is in the credential store (for this profile's server).
+    pub saved_password: bool,
 }
 
 /// `wine` for the Windows client on other systems, nothing otherwise.
@@ -118,6 +130,13 @@ impl Settings {
             }
             self.profiles.push(p);
         }
+        // the username from before saved accounts
+        for p in &mut self.profiles {
+            let u = p.username.trim().to_string();
+            if !u.is_empty() && p.account(&u).is_none() {
+                p.accounts.push(Account { username: u, saved_password: false });
+            }
+        }
         self.current = self.current.min(self.profiles.len() - 1);
     }
 
@@ -127,6 +146,15 @@ impl Settings {
 
     pub fn profile_mut(&mut self) -> &mut Profile {
         &mut self.profiles[self.current]
+    }
+
+    /// Whether a profile other than `except` saved a password for `username` on `server` (they
+    /// share the credential store's entry).
+    pub fn password_shared(&self, except: usize, server: &str, username: &str) -> bool {
+        let key = crate::secrets::server_key(server);
+        self.profiles.iter().enumerate().any(|(i, p)| {
+            i != except && crate::secrets::server_key(&p.server) == key && p.account(username).is_some_and(|a| a.saved_password)
+        })
     }
 
     /// A name not used by another profile: `base`, else `base 2`, `base 3`…
@@ -140,6 +168,22 @@ impl Settings {
 }
 
 impl Profile {
+    pub fn account(&self, username: &str) -> Option<&Account> {
+        let username = username.trim();
+        self.accounts.iter().find(|a| a.username == username)
+    }
+
+    /// The account, moved (or added) to the top of the list.
+    pub fn touch_account(&mut self, username: &str) -> &mut Account {
+        let username = username.trim();
+        let account = match self.accounts.iter().position(|a| a.username == username) {
+            Some(i) => self.accounts.remove(i),
+            None => Account { username: username.into(), saved_password: false },
+        };
+        self.accounts.insert(0, account);
+        &mut self.accounts[0]
+    }
+
     /// The runner as a program and its arguments (empty: start the client directly).
     pub fn runner_words(&self) -> Vec<&str> {
         self.runner.split_whitespace().collect()
@@ -173,6 +217,7 @@ mod tests {
         assert_eq!(s.profiles.len(), 1);
         let p = s.profile();
         assert_eq!((p.server.as_str(), p.dir.as_str(), p.platform, p.username.as_str()), ("http://h:8080", "/games/lmo", Platform::Windows, "blake"));
+        assert_eq!(p.accounts, [Account { username: "blake".into(), saved_password: false }]);
         if !cfg!(windows) {
             assert_eq!(p.runner, "proton run");
         }
@@ -194,6 +239,21 @@ mod tests {
         assert_eq!(s.current, 0);
         assert_eq!(s.unique_name("a"), "a 2");
         assert_eq!(s.unique_name("b"), "b");
+    }
+
+    #[test]
+    fn accounts() {
+        let mut s: Settings = ron::from_str(r#"(profiles:[(name:"a",server:"http://h:1",username:"x",accounts:[(username:"y",saved_password:true)]),(name:"b",server:"h:1/")])"#).unwrap();
+        s.normalize();
+        assert_eq!(s.profile().accounts.iter().map(|a| a.username.as_str()).collect::<Vec<_>>(), ["y", "x"]);
+        assert!(s.password_shared(1, "h:1", "y"));
+        assert!(!s.password_shared(0, "h:1", "y"));
+        assert!(!s.password_shared(1, "h:2", "y"));
+        let b = &mut s.profiles[1];
+        b.touch_account(" z ").saved_password = true;
+        b.touch_account("w");
+        b.touch_account("z");
+        assert_eq!(b.accounts, [Account { username: "z".into(), saved_password: true }, Account { username: "w".into(), saved_password: false }]);
     }
 
     #[test]

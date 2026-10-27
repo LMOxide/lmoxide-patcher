@@ -21,7 +21,7 @@ use lmoxide_patch::{
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
-    install,
+    install, secrets,
     settings::{self, Settings},
     theme::{self, Kind, icon},
     worker::{self, GameStatus, Job, Msg, Outbox, Request, Status},
@@ -57,6 +57,14 @@ pub struct PatcherApp {
     /// other way): installing just checks it and downloads what differs.
     existing: bool,
     password: String,
+    /// The account whose saved password is in `password` (none: typed, or empty).
+    password_of: Option<String>,
+    /// Reading the saved password of this account.
+    loading_password: Option<String>,
+    /// Save the password on Play.
+    remember: bool,
+    /// The credential store's last error, shown in the account card.
+    secret_error: Option<String>,
     /// The install directory was edited and not yet checked.
     dir_edited: bool,
     show_settings: bool,
@@ -66,6 +74,10 @@ pub struct PatcherApp {
     patcher_update: Option<Release>,
     /// Installing it.
     patcher_installing: bool,
+    /// Its banner was put off ("Not now"); the header button brings it back.
+    patcher_banner_hidden: bool,
+    /// Scroll to the banner on the next frame (the header button was clicked).
+    reveal_patcher_banner: bool,
     /// Installed (its version): restart to use it.
     patcher_updated: Option<String>,
     /// This program, as found at startup (on Linux `current_exe` names the deleted file once
@@ -174,11 +186,17 @@ impl PatcherApp {
             installed: None,
             existing: false,
             password: String::new(),
+            password_of: None,
+            loading_password: None,
+            remember: false,
+            secret_error: None,
             dir_edited: false,
             show_settings: false,
             show_profile: false,
             patcher_update: None,
             patcher_installing: false,
+            patcher_banner_hidden: false,
+            reveal_patcher_banner: false,
             patcher_updated: None,
             exe: std::env::current_exe().ok(),
             trust: None,
@@ -186,6 +204,7 @@ impl PatcherApp {
             log: VecDeque::new(),
         };
         app.location_changed();
+        app.account_changed();
         app
     }
 
@@ -279,6 +298,7 @@ impl PatcherApp {
             Msg::PatcherUpdate(r) => {
                 if self.patcher_update.as_ref().is_none_or(|old| old.version != r.version) {
                     self.log(Level::Info, format!("the server offers {} {}", r.name, r.version));
+                    self.patcher_banner_hidden = false;
                 }
                 self.patcher_update = Some(r);
             }
@@ -332,7 +352,7 @@ impl PatcherApp {
                 self.log(Level::Error, e.clone());
                 self.error = Some(e);
             }
-            Msg::PickedDir(_) => unreachable!("handled in drain"),
+            Msg::PickedDir(_) | Msg::Password { .. } | Msg::PasswordStored { .. } => unreachable!("handled in drain"),
         }
     }
 
@@ -364,6 +384,8 @@ impl PatcherApp {
                     self.settings.profile_mut().dir = d.display().to_string();
                     self.location_changed();
                 }
+                Msg::Password { server, username, result } => self.password_loaded(server, username, result),
+                Msg::PasswordStored { server, username, result } => self.password_stored(server, username, result),
                 msg if id == PATCHER_JOB => self.patcher_msg(msg),
                 msg if id == self.job_id => self.handle(msg),
                 _ => {}
@@ -425,9 +447,10 @@ impl PatcherApp {
         }
         self.cancel();
         self.settings.current = index;
-        self.password.clear();
+        self.clear_password();
         self.log(Level::Info, format!("profile {}", self.settings.profile().name));
         self.location_changed();
+        self.account_changed();
     }
 
     /// A new profile like the current one (same server, install and runner), without the account.
@@ -435,6 +458,7 @@ impl PatcherApp {
         let mut p = self.settings.profile().clone();
         p.name = self.settings.unique_name("New profile");
         p.username.clear();
+        p.accounts.clear();
         self.settings.profiles.push(p);
         self.switch_profile(self.settings.profiles.len() - 1);
         self.show_profile = true;
@@ -446,10 +470,141 @@ impl PatcherApp {
         }
         let gone = self.settings.profiles.remove(self.settings.current);
         self.log(Level::Info, format!("deleted profile {} (its install stays on disk)", gone.name));
+        // its saved passwords, unless another profile uses them too
+        for a in gone.accounts.iter().filter(|a| a.saved_password) {
+            if !self.settings.password_shared(usize::MAX, &gone.server, &a.username) {
+                secrets::store(gone.server.clone(), a.username.clone(), None, self.out.clone());
+            }
+        }
         self.settings.current = self.settings.current.min(self.settings.profiles.len() - 1);
         self.cancel();
-        self.password.clear();
+        self.clear_password();
         self.location_changed();
+        self.account_changed();
+    }
+
+    fn clear_password(&mut self) {
+        self.password.clear();
+        self.password_of = None;
+        self.loading_password = None;
+        self.secret_error = None;
+    }
+
+    /// The username changed (picked, typed, another profile): a password loaded for another
+    /// account goes; a known account brings back its checkbox and its saved password.
+    fn account_changed(&mut self) {
+        let username = self.settings.profile().username.trim().to_string();
+        if self.password_of.as_ref().is_some_and(|u| *u != username) {
+            self.clear_password();
+        }
+        let p = self.settings.profile();
+        let Some(account) = p.account(&username) else { return };
+        self.remember = account.saved_password;
+        if account.saved_password && self.password.is_empty() && self.loading_password.as_ref() != Some(&username) {
+            self.loading_password = Some(username.clone());
+            secrets::load(p.server.clone(), username, self.out.clone());
+        }
+    }
+
+    /// The saved password arrived (if it's still wanted: same account, nothing typed since).
+    fn password_loaded(&mut self, server: String, username: String, result: Result<Option<String>, String>) {
+        let p = self.settings.profile();
+        let current = secrets::server_key(&p.server) == secrets::server_key(&server) && p.username.trim() == username;
+        if self.loading_password.as_ref() == Some(&username) {
+            self.loading_password = None;
+        }
+        if !current {
+            return;
+        }
+        match result {
+            Ok(Some(password)) if self.password.is_empty() => {
+                self.password = password;
+                self.password_of = Some(username);
+                self.secret_error = None;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // gone from the store (or the server changed)
+                if let Some(a) = self.settings.profile_mut().accounts.iter_mut().find(|a| a.username == username) {
+                    a.saved_password = false;
+                }
+                self.remember = false;
+                self.log(Level::Warn, format!("no saved password for {username} on this server"));
+            }
+            Err(e) => {
+                self.log(Level::Error, e.clone());
+                self.secret_error = Some(e);
+            }
+        }
+    }
+
+    fn password_stored(&mut self, server: String, username: String, result: Result<bool, String>) {
+        match result {
+            Ok(true) => {
+                self.log(Level::Info, format!("saved the password for {username}"));
+                self.secret_error = None;
+            }
+            Ok(false) => self.log(Level::Info, format!("forgot the saved password for {username}")),
+            Err(e) => {
+                // not saved after all
+                let p = self.settings.profile_mut();
+                if secrets::server_key(&p.server) == secrets::server_key(&server)
+                    && let Some(a) = p.accounts.iter_mut().find(|a| a.username == username)
+                {
+                    a.saved_password = false;
+                }
+                self.log(Level::Error, e.clone());
+                self.secret_error = Some(e);
+            }
+        }
+    }
+
+    /// After logging in: the account goes to the top of the list, and its password into the
+    /// credential store or out of it, as the checkbox says.
+    fn remember_login(&mut self) {
+        let i = self.settings.current;
+        let p = self.settings.profile_mut();
+        let username = p.username.trim().to_string();
+        if username.is_empty() {
+            return;
+        }
+        let server = p.server.clone();
+        let account = p.touch_account(&username);
+        let was = account.saved_password;
+        account.saved_password = self.remember;
+        if self.remember {
+            // unless it's the saved one, unchanged
+            if !was || self.password_of.as_ref() != Some(&username) {
+                secrets::store(server, username.clone(), Some(self.password.clone()), self.out.clone());
+                self.password_of = Some(username);
+            }
+        } else if was {
+            self.forget_password(i, server, username);
+        }
+    }
+
+    /// Takes the account's password out of the store, unless another profile uses it.
+    fn forget_password(&mut self, profile: usize, server: String, username: String) {
+        if !self.settings.password_shared(profile, &server, &username) {
+            secrets::store(server, username, None, self.out.clone());
+        }
+    }
+
+    /// Removes the account from the profile's list, with its saved password.
+    fn forget_account(&mut self, username: &str) {
+        let i = self.settings.current;
+        let p = self.settings.profile_mut();
+        let Some(at) = p.accounts.iter().position(|a| a.username == username) else { return };
+        let a = p.accounts.remove(at);
+        let server = p.server.clone();
+        if p.username.trim() == username {
+            p.username.clear();
+            self.clear_password();
+            self.remember = false;
+        }
+        if a.saved_password {
+            self.forget_password(i, server, a.username);
+        }
     }
 
     fn browse(&self) {
@@ -478,7 +633,10 @@ impl PatcherApp {
         }
         let Some(m) = &self.installed else { return };
         match install::launch(&self.dir(), m, self.settings.profile(), &self.password) {
-            Ok(()) => self.log(Level::Info, format!("started {}", m.launch.executable)),
+            Ok(()) => {
+                self.log(Level::Info, format!("started {}", m.launch.executable));
+                self.remember_login();
+            }
             Err(e) => {
                 let e = format!("{e:#}");
                 self.log(Level::Error, e.clone());
@@ -515,15 +673,17 @@ impl PatcherApp {
         let content = rect.shrink2(vec2(20.0, 0.0)).with_max_y(rect.bottom() - 3.0);
         ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(Layout::left_to_right(Align::Center)), |ui| {
             let (logo, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
-            theme::brick(ui.painter(), logo);
+            theme::logo(ui.painter(), logo);
             ui.add_space(8.0);
             // Title and subtitle centred on the logo, painted (a vertical layout would sit at the top).
             let sub = match &self.info {
                 Some(i) => format!("LMOxide Patcher  ·  {}", i.name),
                 None => "LMOxide Patcher".into(),
             };
-            // Leave room for the chip and the settings button.
-            let room = (ui.available_width() - 170.0).max(40.0);
+            // Leave room for the chip and the header buttons.
+            let pending = self.patcher_pending();
+            let buttons = if pending.is_some() { 208.0 } else { 170.0 };
+            let room = (ui.available_width() - buttons).max(40.0);
             let line = |text: String, font: egui::FontId, color: Color32| {
                 let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
                 job.wrap = egui::text::TextWrapping::truncate_at_width(room);
@@ -538,6 +698,17 @@ impl PatcherApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::icon_button(ui, icon::GEAR, "Settings").clicked() {
                     self.show_settings = true;
+                }
+                if let Some((glyph, tip)) = pending {
+                    ui.add_space(4.0);
+                    let resp = theme::icon_button(ui, glyph, &tip);
+                    // a dot on the corner, ringed in the header's colour
+                    let dot = resp.rect.right_top() + vec2(-6.0, 6.0);
+                    ui.painter().circle(dot, 4.5, theme::BLUE, egui::Stroke::new(2.0, Color32::from_rgb(0x1d, 0x15, 0x40)));
+                    if resp.clicked() {
+                        self.patcher_banner_hidden = false;
+                        self.reveal_patcher_banner = true;
+                    }
                 }
                 ui.add_space(4.0);
                 let (color, text) = self.connection();
@@ -727,11 +898,67 @@ impl PatcherApp {
     fn account_ui(&mut self, ui: &mut egui::Ui) {
         theme::card_title(ui, icon::USER, "Account");
         theme::field_label(ui, "Username");
-        ui.add(theme::text_field(&mut self.settings.profile_mut().username).hint_text("Optional").desired_width(f32::INFINITY));
+        let accounts = self.settings.profile().accounts.clone();
+        let (mut pick, mut forget) = (None, None);
+        ui.horizontal(|ui| {
+            let width = if accounts.is_empty() { ui.available_width() } else { ui.available_width() - 42.0 };
+            let r = ui.add(theme::text_field(&mut self.settings.profile_mut().username).hint_text("Optional").desired_width(width));
+            if r.changed() {
+                self.account_changed();
+            }
+            if accounts.is_empty() {
+                return;
+            }
+            let current = self.settings.profile().username.trim().to_string();
+            let button = theme::icon_button(ui, icon::CARET_DOWN, "Accounts used with this profile");
+            egui::Popup::menu(&button).show(|ui| {
+                for a in &accounts {
+                    ui.horizontal(|ui| {
+                        let text = if a.saved_password { format!("{}   {}", a.username, icon::KEY) } else { a.username.clone() };
+                        let r = ui.add(egui::Button::selectable(a.username == current, text).min_size(vec2(180.0, 0.0)));
+                        if r.on_hover_text(if a.saved_password { "Password saved" } else { "Password not saved" }).clicked() {
+                            pick = Some(a.username.clone());
+                        }
+                        let x = ui.add(egui::Button::new(RichText::new(icon::X).color(theme::WEAK)).frame(false));
+                        if x.on_hover_text("Forget this account and its saved password").clicked() {
+                            forget = Some(a.username.clone());
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(u) = pick {
+            self.settings.profile_mut().username = u;
+            self.account_changed();
+        }
+        if let Some(u) = forget {
+            self.forget_account(&u);
+        }
         theme::field_label(ui, "Password");
-        let r = ui.add(theme::text_field(&mut self.password).password(true).desired_width(f32::INFINITY));
+        let hint = if self.loading_password.is_some() { "Reading the saved password…" } else { "" };
+        let r = ui.add(theme::text_field(&mut self.password).password(true).hint_text(hint).desired_width(f32::INFINITY));
+        if r.changed() {
+            self.password_of = None;
+        }
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.installed.is_some() {
             self.play();
+        }
+        let has_username = !self.settings.profile().username.trim().is_empty();
+        let r = ui
+            .add_enabled(has_username, egui::Checkbox::new(&mut self.remember, "Remember password"))
+            .on_hover_text("Saved in the system's credential store when you press Play");
+        if r.changed() && !self.remember {
+            // unticked: forget it now rather than at the next Play
+            let i = self.settings.current;
+            let p = self.settings.profile_mut();
+            let (server, username) = (p.server.clone(), p.username.trim().to_string());
+            if let Some(a) = p.accounts.iter_mut().find(|a| a.username == username && a.saved_password) {
+                a.saved_password = false;
+                self.forget_password(i, server, username);
+            }
+        }
+        if let Some(e) = &self.secret_error {
+            ui.add(egui::Label::new(RichText::new(format!("{} {e}", icon::WARNING_CIRCLE)).size(12.0).color(theme::AMBER)).wrap());
         }
         ui.add_space(2.0);
         if self.missing_password() {
@@ -744,7 +971,7 @@ impl PatcherApp {
         }
         ui.add(
             egui::Label::new(
-                RichText::new("With a username, Play logs you in automatically. The password is never saved.")
+                RichText::new("With a username, Play logs you in automatically. Remembered passwords are kept in the system's credential store, never in the settings.")
                     .size(12.0)
                     .color(theme::WEAK),
             )
@@ -924,8 +1151,21 @@ impl PatcherApp {
         });
     }
 
+    /// The header button's icon and tooltip while a patcher update waits (to install or to
+    /// restart into).
+    fn patcher_pending(&self) -> Option<(&'static str, String)> {
+        if let Some(version) = &self.patcher_updated {
+            return Some((icon::CHECK_CIRCLE, format!("Patcher {version} is installed: restart to use it")));
+        }
+        let r = self.patcher_update.as_ref()?;
+        Some((icon::CLOUD_DOWN, format!("Patcher {} is available (you have {})", r.version, worker::PATCHER_VERSION)))
+    }
+
     /// A newer build of this patcher, or the one just installed.
     fn patcher_banner(&mut self, ui: &mut egui::Ui) {
+        if std::mem::take(&mut self.reveal_patcher_banner) {
+            ui.scroll_to_cursor(Some(Align::TOP));
+        }
         if let Some(version) = self.patcher_updated.clone() {
             theme::callout(ui, icon::CHECK_CIRCLE, theme::GREEN, &format!("The patcher was updated to {version}. Restart it to use the new version."));
             if ui.button("Restart the patcher").clicked() {
@@ -934,7 +1174,7 @@ impl PatcherApp {
             }
             return;
         }
-        let Some(r) = &self.patcher_update else { return };
+        let Some(r) = self.patcher_update.as_ref().filter(|_| !self.patcher_banner_hidden) else { return };
         let text = format!(
             "The server offers version {} of this patcher (you have {}, {} to download).",
             r.version,
@@ -948,7 +1188,7 @@ impl PatcherApp {
                 self.update_patcher();
             }
             if ui.add_enabled(!self.patcher_installing, egui::Button::new("Not now")).clicked() {
-                self.patcher_update = None;
+                self.patcher_banner_hidden = true;
             }
         });
     }
@@ -1065,6 +1305,9 @@ impl PatcherApp {
             ui.checkbox(&mut self.settings.check_patcher_updates, "Offer newer versions of this patcher")
                 .on_hover_text("When the server has a newer build signed with the key your install trusts");
             ui.label(RichText::new(format!("{} {}", worker::PATCHER_NAME, worker::PATCHER_VERSION)).size(12.0).color(theme::WEAK));
+            if let Some((_, tip)) = self.patcher_pending() {
+                ui.label(RichText::new(tip).size(12.0).color(theme::BLUE));
+            }
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 theme::big_button(ui, Kind::Primary, "", "Done", true, vec2(96.0, 34.0)).clicked()

@@ -6,6 +6,7 @@
 
 mod app;
 mod install;
+mod secrets;
 mod settings;
 mod theme;
 mod worker;
