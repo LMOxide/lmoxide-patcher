@@ -45,6 +45,8 @@ pub struct PatcherApp {
     info: Option<Info>,
     /// The game server, from the server's API (`Info::api_url`).
     game: Option<GameStatus>,
+    /// The other game servers on the server's host (`Info::other_servers`).
+    others: Vec<worker::Other>,
     /// Server warnings already logged.
     warned: Vec<String>,
     status: Option<Status>,
@@ -179,6 +181,7 @@ impl PatcherApp {
             run: RunState::default(),
             info: None,
             game: None,
+            others: Vec::new(),
             warned: Vec::new(),
             status: None,
             error: None,
@@ -235,6 +238,7 @@ impl PatcherApp {
         self.existing = self.installed.is_none() && self.dir().join(executable_name(platform)).is_file();
         self.info = None;
         self.game = None;
+        self.others.clear();
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
@@ -295,6 +299,7 @@ impl PatcherApp {
                 self.info = Some(info);
             }
             Msg::Game(g) => self.game = Some(g),
+            Msg::Others(o) => self.others = o,
             Msg::PatcherUpdate(r) => {
                 if self.patcher_update.as_ref().is_none_or(|old| old.version != r.version) {
                     self.log(Level::Info, format!("the server offers {} {}", r.name, r.version));
@@ -677,7 +682,10 @@ impl PatcherApp {
             ui.add_space(8.0);
             // Title and subtitle centred on the logo, painted (a vertical layout would sit at the top).
             let sub = match &self.info {
-                Some(i) => format!("LMOxide Patcher  ·  {}", i.name),
+                Some(i) => match &i.kind {
+                    Some(k) => format!("LMOxide Patcher  ·  {}  ·  {}", i.name, kind_label(k).0),
+                    None => format!("LMOxide Patcher  ·  {}", i.name),
+                },
                 None => "LMOxide Patcher".into(),
             };
             // Leave room for the chip and the header buttons.
@@ -1026,6 +1034,8 @@ impl PatcherApp {
     }
 
     fn server_ui(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.working();
+        let mut switch = None;
         let Some(info) = &self.info else { return };
         theme::card(ui, |ui| {
             theme::card_title(ui, icon::SERVER, &format!("Server  ·  {}", info.name));
@@ -1041,6 +1051,31 @@ impl PatcherApp {
                     }
                 });
                 ui.end_row();
+                if let Some(kind) = &info.kind {
+                    key(ui, "Kind");
+                    let (name, about) = kind_label(kind);
+                    ui.label(RichText::new(name).strong()).on_hover_text(about);
+                    ui.end_row();
+                }
+                let others: Vec<&worker::Other> = self.others.iter().filter(|o| o.info.is_some()).collect();
+                if !others.is_empty() {
+                    key(ui, "Also here");
+                    ui.horizontal_wrapped(|ui| {
+                        for o in others {
+                            let i = o.info.as_ref().unwrap();
+                            let what = i.kind.as_deref().map_or(String::new(), |k| format!(" ({})", kind_label(k).0));
+                            let button = egui::Button::new(format!("{} {}{what}", icon::SERVER, i.name));
+                            let hover = format!(
+                                "Switch this profile to {}{what}: game server {}, patch server {}. Same client files; the update only changes what differs.",
+                                i.name, i.universe_addr, o.url
+                            );
+                            if ui.add_enabled(idle, button).on_hover_text(hover).clicked() {
+                                switch = Some(o.url.clone());
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
                 if let Some(site) = &info.website {
                     key(ui, "Website");
                     let open = self.game.as_ref().and_then(|g| g.registration_open) == Some(true);
@@ -1074,6 +1109,11 @@ impl PatcherApp {
                 theme::callout(ui, icon::WARNING, theme::AMBER, w);
             }
         });
+        if let Some(url) = switch {
+            self.log(Level::Info, format!("switching this profile to {url}"));
+            self.settings.profile_mut().server = url;
+            self.location_changed();
+        }
     }
 
     fn verified_ui(&mut self, ui: &mut egui::Ui) {
@@ -1437,6 +1477,16 @@ impl eframe::App for PatcherApp {
 }
 
 /// "online, 3 players" and its colour, from the API's status.
+/// A server kind (`Info::kind`) as shown: a name, and what it means.
+fn kind_label(kind: &str) -> (String, &'static str) {
+    match kind {
+        "progression" => ("Progression".into(), "XP, levels and minifigure ranks, as live"),
+        "adventure" => ("Adventure".into(), "Everything unlocked: every minifigure and upgrade from the start"),
+        "world-editor" => ("World editor".into(), "A survey server: nothing attacks; place and fix the worlds' content with the dev UI's world editor"),
+        other => (other.to_string(), "Named by the server's host"),
+    }
+}
+
 fn game_line(g: &GameStatus) -> Option<(Color32, String)> {
     let s = g.status.as_ref()?;
     Some(match (s.game_server_online, s.maintenance, s.players_online) {

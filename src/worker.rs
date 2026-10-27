@@ -81,6 +81,9 @@ pub enum Status {
 
 pub enum Msg {
     Info(Info),
+    /// The other game servers on the server's host (`Info::other_servers`), each with its
+    /// info if it answered.
+    Others(Vec<Other>),
     Game(GameStatus),
     /// The server offers a newer build of this patcher, signed with the install's key.
     PatcherUpdate(Release),
@@ -160,6 +163,10 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
     let err = |e| describe(&client, req.platform, e);
     let info = client.info().await.map_err(err)?;
     out.send(Msg::Info(info.clone()));
+    if !info.other_servers.is_empty() {
+        let (urls, out) = (info.other_servers.clone(), out.clone());
+        tokio::spawn(async move { out.send(Msg::Others(others(urls).await)) });
+    }
     if let Some(api) = info.api_url.clone() {
         let out = out.clone();
         tokio::spawn(async move { out.send(Msg::Game(game_status(&api).await)) });
@@ -249,6 +256,25 @@ pub async fn install_patcher(server: String, release: Release, exe: PathBuf, out
 }
 
 /// Asks the server's API about the game server (best effort: errors leave fields empty).
+/// Another game server on the same host (another patch server).
+#[derive(Debug, Clone)]
+pub struct Other {
+    pub url: String,
+    pub info: Option<Info>,
+}
+
+async fn others(urls: Vec<String>) -> Vec<Other> {
+    let mut out = Vec::new();
+    for url in urls {
+        let info = match Client::new(&url) {
+            Ok(c) => tokio::time::timeout(Duration::from_secs(10), c.info()).await.ok().and_then(Result::ok),
+            Err(_) => None,
+        };
+        out.push(Other { url, info });
+    }
+    out
+}
+
 async fn game_status(api: &str) -> GameStatus {
     let base = api.trim_end_matches('/');
     let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build();
