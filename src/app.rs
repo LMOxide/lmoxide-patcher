@@ -45,8 +45,6 @@ pub struct PatcherApp {
     info: Option<Info>,
     /// The game server, from the server's API (`Info::api_url`).
     game: Option<GameStatus>,
-    /// The other game servers on the server's host (`Info::other_servers`).
-    others: Vec<worker::Other>,
     /// Server warnings already logged.
     warned: Vec<String>,
     status: Option<Status>,
@@ -181,7 +179,6 @@ impl PatcherApp {
             run: RunState::default(),
             info: None,
             game: None,
-            others: Vec::new(),
             warned: Vec::new(),
             status: None,
             error: None,
@@ -232,13 +229,18 @@ impl PatcherApp {
     }
 
     /// Server, directory or platform changed: forget what we knew and check again.
+    /// The game mode this profile plays, as the server names it (servers with `modes`).
+    fn mode_name(&self, info: &Info) -> Option<String> {
+        let current = self.settings.profile().mode.trim();
+        info.modes.iter().find(|m| m.id == current).or(info.modes.first()).map(|m| m.name.clone())
+    }
+
     fn location_changed(&mut self) {
         let platform = self.settings.profile().platform;
         self.installed = worker::installed(&self.dir(), platform);
         self.existing = self.installed.is_none() && self.dir().join(executable_name(platform)).is_file();
         self.info = None;
         self.game = None;
-        self.others.clear();
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
@@ -271,6 +273,7 @@ impl PatcherApp {
             trust,
             cancel: Arc::new(AtomicBool::new(false)),
             patcher_updates: self.settings.check_patcher_updates && self.patcher_updated.is_none(),
+            mode: Some(self.settings.profile().mode.trim().to_string()).filter(|m| !m.is_empty()),
         };
         let cancel = req.cancel.clone();
         self.task = Some((job, self.rt.spawn(worker::run(req, self.out.for_job(self.job_id))), cancel));
@@ -299,7 +302,6 @@ impl PatcherApp {
                 self.info = Some(info);
             }
             Msg::Game(g) => self.game = Some(g),
-            Msg::Others(o) => self.others = o,
             Msg::PatcherUpdate(r) => {
                 if self.patcher_update.as_ref().is_none_or(|old| old.version != r.version) {
                     self.log(Level::Info, format!("the server offers {} {}", r.name, r.version));
@@ -682,9 +684,10 @@ impl PatcherApp {
             ui.add_space(8.0);
             // Title and subtitle centred on the logo, painted (a vertical layout would sit at the top).
             let sub = match &self.info {
-                Some(i) => match &i.kind {
-                    Some(k) => format!("LMOxide Patcher  ·  {}  ·  {}", i.name, kind_label(k).0),
-                    None => format!("LMOxide Patcher  ·  {}", i.name),
+                Some(i) => match (self.mode_name(i), &i.kind) {
+                    (Some(m), _) => format!("LMOxide Patcher  ·  {}  ·  {m}", i.name),
+                    (None, Some(k)) => format!("LMOxide Patcher  ·  {}  ·  {}", i.name, kind_label(k).0),
+                    (None, None) => format!("LMOxide Patcher  ·  {}", i.name),
                 },
                 None => "LMOxide Patcher".into(),
             };
@@ -1035,7 +1038,7 @@ impl PatcherApp {
 
     fn server_ui(&mut self, ui: &mut egui::Ui) {
         let idle = !self.working();
-        let mut switch = None;
+        let mut pick = None;
         let Some(info) = &self.info else { return };
         theme::card(ui, |ui| {
             theme::card_title(ui, icon::SERVER, &format!("Server  ·  {}", info.name));
@@ -1044,36 +1047,42 @@ impl PatcherApp {
                     ui.label(RichText::new(k).color(theme::WEAK));
                 };
                 key(ui, "Game server");
+                // the chosen game mode's universe agent (its port picks the mode)
+                let current = self.settings.profile().mode.trim();
+                let addr = info.modes.iter().find(|m| m.id == current).or(info.modes.first()).map_or(&info.universe_addr, |m| &m.universe_addr);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&info.universe_addr).monospace());
+                    ui.label(RichText::new(addr).monospace());
                     if let Some((color, text)) = self.game.as_ref().and_then(game_line) {
                         ui.label(RichText::new(text).color(color));
                     }
                 });
                 ui.end_row();
-                if let Some(kind) = &info.kind {
-                    key(ui, "Kind");
+                if !info.modes.is_empty() {
+                    key(ui, "Game Mode");
+                    let current = self.settings.profile().mode.trim().to_string();
+                    let shown = info.modes.iter().find(|m| m.id == current).or(info.modes.first());
+                    let label = shown.map_or(String::new(), |m| m.name.clone());
+                    egui::ComboBox::from_id_salt("game-mode")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            for m in &info.modes {
+                                let selected = shown.is_some_and(|s| s.id == m.id);
+                                let mut hover = m.description.clone();
+                                if m.requires.as_deref() == Some("editor") {
+                                    hover.push_str(" For the server's world editors (GM level 1 and up).");
+                                }
+                                if ui.add_enabled(idle, egui::Button::selectable(selected, &m.name)).on_hover_text(hover).clicked() && !selected {
+                                    pick = Some(m.id.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Each game mode has its own characters. Changing it updates the client's settings (one small file).");
+                    ui.end_row();
+                } else if let Some(kind) = &info.kind {
+                    key(ui, "Game Mode");
                     let (name, about) = kind_label(kind);
                     ui.label(RichText::new(name).strong()).on_hover_text(about);
-                    ui.end_row();
-                }
-                let others: Vec<&worker::Other> = self.others.iter().filter(|o| o.info.is_some()).collect();
-                if !others.is_empty() {
-                    key(ui, "Also here");
-                    ui.horizontal_wrapped(|ui| {
-                        for o in others {
-                            let i = o.info.as_ref().unwrap();
-                            let what = i.kind.as_deref().map_or(String::new(), |k| format!(" ({})", kind_label(k).0));
-                            let button = egui::Button::new(format!("{} {}{what}", icon::SERVER, i.name));
-                            let hover = format!(
-                                "Switch this profile to {}{what}: game server {}, patch server {}. Same client files; the update only changes what differs.",
-                                i.name, i.universe_addr, o.url
-                            );
-                            if ui.add_enabled(idle, button).on_hover_text(hover).clicked() {
-                                switch = Some(o.url.clone());
-                            }
-                        }
-                    });
                     ui.end_row();
                 }
                 if let Some(site) = &info.website {
@@ -1109,10 +1118,12 @@ impl PatcherApp {
                 theme::callout(ui, icon::WARNING, theme::AMBER, w);
             }
         });
-        if let Some(url) = switch {
-            self.log(Level::Info, format!("switching this profile to {url}"));
-            self.settings.profile_mut().server = url;
-            self.location_changed();
+        if let Some(mode) = pick {
+            self.log(Level::Info, format!("game mode: {mode}"));
+            self.settings.profile_mut().mode = mode;
+            // an install gets the mode's settings now (an update changes LocalConfig.xml only)
+            let job = if self.installed.is_some() { Job::Sync { full: false } } else { Job::Check };
+            self.start(job, None);
         }
     }
 

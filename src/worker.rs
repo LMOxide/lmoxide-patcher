@@ -44,6 +44,9 @@ pub struct Request {
     pub cancel: Arc<AtomicBool>,
     /// Look for a newer build of this patcher on the server (checks only).
     pub patcher_updates: bool,
+    /// The game mode to install (its LocalConfig.xml; `Manifest::for_mode`); `None`: the
+    /// server's default.
+    pub mode: Option<String>,
 }
 
 /// This program's name in the server's patcher releases.
@@ -81,9 +84,6 @@ pub enum Status {
 
 pub enum Msg {
     Info(Info),
-    /// The other game servers on the server's host (`Info::other_servers`), each with its
-    /// info if it answered.
-    Others(Vec<Other>),
     Game(GameStatus),
     /// The server offers a newer build of this patcher, signed with the install's key.
     PatcherUpdate(Release),
@@ -163,10 +163,6 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
     let err = |e| describe(&client, req.platform, e);
     let info = client.info().await.map_err(err)?;
     out.send(Msg::Info(info.clone()));
-    if !info.other_servers.is_empty() {
-        let (urls, out) = (info.other_servers.clone(), out.clone());
-        tokio::spawn(async move { out.send(Msg::Others(others(urls).await)) });
-    }
     if let Some(api) = info.api_url.clone() {
         let out = out.clone();
         tokio::spawn(async move { out.send(Msg::Game(game_status(&api).await)) });
@@ -175,6 +171,11 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
         patcher_update(&client, &info, req, out).await;
     }
     let installed = installed(&req.dir, req.platform);
+    // a game mode chosen that the install isn't for: an update (it changes LocalConfig.xml)
+    if installed.is_some() && sync::load_mode(&req.dir) != req.mode {
+        out.send(Msg::Status(Status::UpdateAvailable));
+        return Ok(());
+    }
     // The server's hints answer most checks without downloading the manifest.
     match (&installed, info.revisions.get(&req.platform)) {
         (Some(i), Some(rev)) if *rev == i.revision() => {
@@ -256,25 +257,6 @@ pub async fn install_patcher(server: String, release: Release, exe: PathBuf, out
 }
 
 /// Asks the server's API about the game server (best effort: errors leave fields empty).
-/// Another game server on the same host (another patch server).
-#[derive(Debug, Clone)]
-pub struct Other {
-    pub url: String,
-    pub info: Option<Info>,
-}
-
-async fn others(urls: Vec<String>) -> Vec<Other> {
-    let mut out = Vec::new();
-    for url in urls {
-        let info = match Client::new(&url) {
-            Ok(c) => tokio::time::timeout(Duration::from_secs(10), c.info()).await.ok().and_then(Result::ok),
-            Err(_) => None,
-        };
-        out.push(Other { url, info });
-    }
-    out
-}
-
 async fn game_status(api: &str) -> GameStatus {
     let base = api.trim_end_matches('/');
     let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build();
@@ -340,13 +322,14 @@ async fn sync_job(req: &Request, out: &Outbox) -> Result<(), String> {
     };
     match req.job {
         Job::Sync { full } => {
-            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), ..Default::default() };
+            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), mode: req.mode.clone(), ..Default::default() };
             let (plan, report) = sync::sync(&client, &req.dir, &manifest, &opts, &progress).await.map_err(err)?;
             sync::save_manifest(&req.dir, &signed).map_err(err)?;
+            sync::save_mode(&req.dir, req.mode.as_deref()).map_err(err)?;
             out.send(Msg::Synced { plan, report, manifest });
         }
         Job::Verify { full } => {
-            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), ..Default::default() };
+            let opts = Options { jobs: req.jobs.max(1), full_check: full, cancel: Some(req.cancel.clone()), mode: req.mode.clone(), ..Default::default() };
             let plan = sync::plan(&req.dir, &manifest, &opts, &progress).await.map_err(err)?;
             out.send(Msg::Verified(plan));
         }

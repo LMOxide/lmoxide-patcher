@@ -24,6 +24,12 @@ bottom expands into the log.
    differences. **Repair** rehashes every file (instead of trusting unchanged size and
    modification time) and fixes whatever differs.
 5. **Play** starts the client as the manifest says (executable, arguments, environment).
+6. **Game Mode** (Server card): the server's game modes, e.g. **Progression** (as live: level 1
+   up, XP, stars, ranks), **Maxxed** (everything unlocked) and **World Editor** (for the server's
+   world editors). Each mode has its own characters. The choice is kept per profile and in the
+   install (`.lmoxide/mode`); changing it updates the install at once, which only rewrites the
+   client's `LocalConfig.xml` (the mode's game address; the client's own patcher keeps it).
+   A server with one mode shows just its name.
 
 Enter (outside a text field) presses the yellow button. The gear opens the settings: parallel
 downloads, and whether to offer newer versions of the patcher.

@@ -60,6 +60,9 @@ pub struct Profile {
     pub args: String,
     /// Extra environment variables, `NAME=value` per line.
     pub env: String,
+    /// The game mode played: one of the server's `modes` (`progression`, `maxed`,
+    /// `world-editor`); empty: the server's default.
+    pub mode: String,
 }
 
 impl Default for Settings {
@@ -92,6 +95,7 @@ impl Default for Profile {
             runner: default_runner(platform).into(),
             args: String::new(),
             env: String::new(),
+            mode: String::new(),
         }
     }
 }
