@@ -43,6 +43,7 @@ mod tests {
             universe_addr: "h:1".into(),
             files: vec![],
             remove: vec![],
+            modes: vec![],
             launch: Launch {
                 executable: "LMO".into(),
                 args: vec!["-verified".into()],
