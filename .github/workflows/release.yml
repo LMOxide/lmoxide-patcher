@@ -3,6 +3,10 @@
 #   server's --patcher-dir expects them, so a server can offer them as a self-update as they are
 #   (Linux built on Debian 12: glibc 2.36 or newer)
 # - lmoxide-patcher-gui-1.2.3-macos.tar.gz: one binary for Apple silicon and Intel (unsigned)
+# - the same three files without the version (lmoxide-patcher-gui-windows.exe, -linux,
+#   -macos.tar.gz), copied rather than built again, for links that always get the newest release:
+#   https://github.com/LMOxide/lmoxide-patcher/releases/latest/download/lmoxide-patcher-gui-windows.exe
+#   (patch servers ignore them: a --patcher-dir file needs a numeric version)
 # The patcher library comes from the lmoxide repository by path, checked out beside this one
 # (input lmoxide_ref, default main).
 name: Release
@@ -100,6 +104,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - name: Copies without the version
+        run: |
+          for f in lmoxide-patcher-gui-*; do
+            cp "$f" "$(echo "$f" | sed -E 's/-[0-9]+(\.[0-9]+)*-/-/')"
+          done
+          ls -l
       - name: Checksums
         run: sha256sum lmoxide-patcher-gui-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2

@@ -33,18 +33,18 @@ Its state lives in `<install>/.lmoxide/`. Window settings are kept by eframe
 
 ## Install without Rust
 
-Download the patcher for your system from the
-[Releases](https://github.com/LMOxide/lmoxide-patcher/releases) page and run it. Nothing else
-to install.
+Download the patcher for your system and run it. Nothing else to install. These links always
+get the newest release; the [Releases](https://github.com/LMOxide/lmoxide-patcher/releases) page
+has the same files with their version in the name.
 
-| System | File |
+| System | Download |
 |---|---|
-| Windows | `lmoxide-patcher-gui-<version>-windows.exe` |
-| Linux | `lmoxide-patcher-gui-<version>-linux` (`chmod +x` it first; glibc 2.36 or newer) |
-| macOS | `lmoxide-patcher-gui-<version>-macos.tar.gz` (Apple silicon and Intel; unsigned: right click → Open the first time) |
+| Windows | [lmoxide-patcher-gui-windows.exe](https://github.com/LMOxide/lmoxide-patcher/releases/latest/download/lmoxide-patcher-gui-windows.exe) |
+| Linux | [lmoxide-patcher-gui-linux](https://github.com/LMOxide/lmoxide-patcher/releases/latest/download/lmoxide-patcher-gui-linux) (`chmod +x` it first; glibc 2.36 or newer) |
+| macOS | [lmoxide-patcher-gui-macos.tar.gz](https://github.com/LMOxide/lmoxide-patcher/releases/latest/download/lmoxide-patcher-gui-macos.tar.gz) (Apple silicon and Intel; unsigned: right click → Open the first time) |
 
 On Windows and Linux it then updates itself when the server offers a newer build. Server hosts:
-the Windows and Linux files are named as the patch server's `--patcher-dir` expects, so they can
+the Windows and Linux files with the version in their names are named as the patch server's `--patcher-dir` expects, so they can
 be put there as they are (lmoxide's
 [HOSTING.md](https://github.com/LMOxide/lmoxide/blob/main/docs/HOSTING.md)).
 
