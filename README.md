@@ -31,6 +31,23 @@ write the same install folders.
 Its state lives in `<install>/.lmoxide/`. Window settings are kept by eframe
 (`~/.local/share/lmoxide-patcher/` on Linux).
 
+## Install without Rust
+
+Download the patcher for your system from the
+[Releases](https://github.com/LMOxide/lmoxide-patcher/releases) page and run it. Nothing else
+to install.
+
+| System | File |
+|---|---|
+| Windows | `lmoxide-patcher-gui-<version>-windows.exe` |
+| Linux | `lmoxide-patcher-gui-<version>-linux` (`chmod +x` it first; glibc 2.36 or newer) |
+| macOS | `lmoxide-patcher-gui-<version>-macos.tar.gz` (Apple silicon and Intel; unsigned: right click → Open the first time) |
+
+On Windows and Linux it then updates itself when the server offers a newer build. Server hosts:
+the Windows and Linux files are named as the patch server's `--patcher-dir` expects, so they can
+be put there as they are (lmoxide's
+[HOSTING.md](https://github.com/LMOxide/lmoxide/blob/main/docs/HOSTING.md)).
+
 ## Setup
 
 You need Rust (edition 2024), and the lmoxide repo checked out next to this one: the

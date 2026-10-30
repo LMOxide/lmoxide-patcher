@@ -1,0 +1,110 @@
+# On a version tag (v1.2.3, the same as Cargo.toml's version), on the GitHub Release:
+# - lmoxide-patcher-gui-1.2.3-windows.exe and lmoxide-patcher-gui-1.2.3-linux: named as a patch
+#   server's --patcher-dir expects them, so a server can offer them as a self-update as they are
+#   (Linux built on Debian 12: glibc 2.36 or newer)
+# - lmoxide-patcher-gui-1.2.3-macos.tar.gz: one binary for Apple silicon and Intel (unsigned)
+# The patcher library comes from the lmoxide repository by path, checked out beside this one
+# (input lmoxide_ref, default main).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      lmoxide_ref:
+        description: lmoxide branch, tag or commit to build against
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  LMOXIDE_REF: ${{ inputs.lmoxide_ref || 'main' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            container: rust:1-bookworm
+            platform: linux
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: lmoxide-patcher
+      - uses: actions/checkout@v5
+        with:
+          repository: LMOxide/lmoxide
+          ref: ${{ env.LMOXIDE_REF }}
+          path: lmoxide
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lmoxide-patcher
+      - name: Version
+        id: version
+        shell: bash
+        working-directory: lmoxide-patcher
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # the self-update compares this with the version in the file name
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build
+        shell: bash
+        working-directory: lmoxide-patcher
+        run: |
+          v=${{ steps.version.outputs.version }}
+          mkdir -p ../out
+          case "${{ matrix.platform }}" in
+            linux)
+              cargo build --release
+              cp target/release/lmoxide-patcher-gui "../out/lmoxide-patcher-gui-$v-linux" ;;
+            windows)
+              cargo build --release
+              cp target/release/lmoxide-patcher-gui.exe "../out/lmoxide-patcher-gui-$v-windows.exe" ;;
+            macos)
+              cargo build --release --target aarch64-apple-darwin
+              cargo build --release --target x86_64-apple-darwin
+              mkdir -p "../out/lmoxide-patcher-gui-$v-macos"
+              lipo -create -output "../out/lmoxide-patcher-gui-$v-macos/lmoxide-patcher-gui" \
+                target/aarch64-apple-darwin/release/lmoxide-patcher-gui \
+                target/x86_64-apple-darwin/release/lmoxide-patcher-gui
+              tar czf "../out/lmoxide-patcher-gui-$v-macos.tar.gz" -C ../out "lmoxide-patcher-gui-$v-macos"
+              rm -r "../out/lmoxide-patcher-gui-$v-macos" ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum lmoxide-patcher-gui-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lmoxide-patcher-gui-*
+            SHA256SUMS
+          generate_release_notes: true

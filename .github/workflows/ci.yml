@@ -1,0 +1,34 @@
+# The patcher library comes from the lmoxide repository by path (../lmoxide/crates/lmoxide-patch),
+# so both are checked out side by side, as for local development.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: lmoxide-patcher
+      - uses: actions/checkout@v5
+        with:
+          repository: LMOxide/lmoxide
+          path: lmoxide
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lmoxide-patcher
+      - run: cargo test
+        working-directory: lmoxide-patcher

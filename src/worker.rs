@@ -230,6 +230,11 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
 /// Offers a newer build of this patcher if `info` lists one and it verifies with the key the
 /// install trusts (no trusted key yet: nothing is offered; best effort, failures are logged).
 async fn patcher_update(client: &Client, info: &Info, req: &Request, out: &Outbox) {
+    // servers offer builds for the client platforms (windows, linux); `Platform::host()` is
+    // windows on macOS (the client runs under Wine there), whose build would replace this one
+    if !cfg!(any(windows, target_os = "linux")) {
+        return;
+    }
     let platform = Platform::host();
     let listed = info.patchers.get(PATCHER_NAME).and_then(|b| b.get(&platform));
     if !listed.is_some_and(|v| compare_versions(v, PATCHER_VERSION).is_gt()) {

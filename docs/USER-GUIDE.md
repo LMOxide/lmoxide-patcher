@@ -99,7 +99,9 @@ off.
 Start the patch server with `--patcher-dir` (see
 [`docs/PATCHING.md`](https://github.com/LMOxide/lmoxide/blob/main/docs/PATCHING.md) in lmoxide).
 Copy the build into that directory as `lmoxide-patcher-gui-<version>-<linux|windows>[.exe]`,
-with the version from `Cargo.toml`, and send the server `SIGHUP`.
+with the version from `Cargo.toml`, and send the server `SIGHUP`. The Windows and Linux files on
+the [Releases](https://github.com/LMOxide/lmoxide-patcher/releases) page already have those
+names. macOS builds don't update themselves: servers only offer Windows and Linux builds.
 
 </details>
 
