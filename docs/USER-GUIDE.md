@@ -79,6 +79,10 @@ key and asks before trusting it (the CLI trusts it silently). It is then stored 
 If a later manifest is signed with a different key, the window says so and shows both keys. Only
 accept the new one if the server's operator changed it.
 
+The patcher remembers every key you accepted, for all profiles. A server signed with one of them
+doesn't ask again, so you can switch one install between servers without confirming the same key
+each time. Only a key you haven't accepted before asks.
+
 File bodies are checked against the signed sha256, so plain HTTP is safe against tampering.
 
 <br clear="right">

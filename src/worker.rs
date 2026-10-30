@@ -3,6 +3,8 @@
 //! Trust differs from the CLI on purpose: the CLI trusts the first key it sees, the window asks.
 //! A job that meets an unknown key (fresh install) or a changed one stops with
 //! [`Msg::Trust`]; if the user accepts, the window runs the job again with that key pinned.
+//! Keys the user accepted before ([`Request::trusted_keys`]) are taken without asking, so
+//! switching an install between servers doesn't ask about the same key again.
 
 use std::{
     path::PathBuf,
@@ -15,7 +17,7 @@ use serde::Deserialize;
 use lmoxide_patch::{
     Error, Info, Manifest, Platform, SignedManifest,
     client::{Client, Trust, stored_key},
-    manifest::parse_public_key,
+    manifest::{parse_public_key, public_key_hex},
     release::{Release, compare_versions},
     selfupdate,
     sync::{self, Options, Plan, Progress, Report},
@@ -40,6 +42,8 @@ pub struct Request {
     pub jobs: usize,
     /// A key the user accepted (hex), pinned instead of the stored one.
     pub trust: Option<String>,
+    /// Keys (hex) the user trusted before, for any server: taken without asking.
+    pub trusted_keys: Vec<String>,
     /// Set by the window to stop hashing and downloads (the task is aborted too).
     pub cancel: Arc<AtomicBool>,
     /// Look for a newer build of this patcher on the server (checks only).
@@ -131,6 +135,13 @@ impl Outbox {
     }
 }
 
+impl Request {
+    /// Whether the user trusted `key` (hex) before.
+    fn knows(&self, key: &str) -> bool {
+        self.trusted_keys.iter().any(|k| k.eq_ignore_ascii_case(key.trim()))
+    }
+}
+
 pub async fn run(req: Request, out: Outbox) {
     let result = match req.job {
         Job::Check => check(&req, &out).await,
@@ -219,6 +230,8 @@ async fn check(req: &Request, out: &Outbox) -> Result<(), String> {
                 Some(_) => Status::UpdateAvailable,
                 None => Status::NotInstalled { bytes: m.files.iter().map(|f| f.size).sum() },
             },
+            // a key trusted before: the update takes it without asking
+            Err(Error::KeyMismatch { got, .. }) if req.knows(&got) => Status::UpdateAvailable,
             Err(Error::KeyMismatch { .. }) => Status::KeyChanged,
             Err(e) => return Err(err(e)),
         },
@@ -305,7 +318,15 @@ async fn sync_job(req: &Request, out: &Outbox) -> Result<(), String> {
     let client = Client::new(&req.server).map_err(|e| e.to_string())?;
     let err = |e| describe(&client, req.platform, e);
     let signed = fetch(&client, req.platform, out).await.map_err(err)?;
-    let trust = match (&req.trust, stored_key(&req.dir).map_err(err)?) {
+    let stored = stored_key(&req.dir).map_err(err)?;
+    let remembered = req.trust.is_none()
+        && req.knows(&signed.key)
+        && stored.is_none_or(|k| !public_key_hex(&k).eq_ignore_ascii_case(signed.key.trim()));
+    if remembered {
+        out.send(Msg::Log("the server signs with a key you trusted before".into()));
+    }
+    let pinned = req.trust.as_ref().or(remembered.then_some(&signed.key));
+    let trust = match (pinned, stored) {
         (Some(k), _) => Trust::Key(parse_public_key(k).map_err(err)?),
         (None, Some(_)) => Trust::FirstUse,
         (None, None) => {
@@ -341,4 +362,64 @@ async fn sync_job(req: &Request, out: &Outbox) -> Result<(), String> {
         Job::Check => unreachable!(),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `job` against `server` and returns what it reported.
+    async fn sync_msgs(server: &str, dir: &std::path::Path, trust: Option<String>, trusted_keys: &[String]) -> Vec<Msg> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let req = Request {
+            job: Job::Sync { full: false },
+            server: server.into(),
+            dir: dir.into(),
+            platform: Platform::Linux,
+            jobs: 1,
+            trust,
+            trusted_keys: trusted_keys.to_vec(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            patcher_updates: false,
+            mode: None,
+        };
+        run(req, Outbox::new(tx, egui::Context::default())).await;
+        rx.try_iter().map(|(_, m)| m).collect()
+    }
+
+    fn asks(msgs: &[Msg]) -> Option<String> {
+        msgs.iter().find_map(|m| match m {
+            Msg::Trust { got, .. } => Some(got.clone()),
+            _ => None,
+        })
+    }
+
+    fn synced(msgs: &[Msg]) -> bool {
+        msgs.iter().any(|m| matches!(m, Msg::Synced { .. }))
+    }
+
+    /// Switching one install between two servers asks about each key once.
+    /// Needs two patch servers with different keys serving a Linux client, e.g.
+    /// `LMOXIDE_TEST_SERVERS=http://127.0.0.1:18181,http://127.0.0.1:18182`.
+    #[tokio::test]
+    #[ignore]
+    async fn switching_servers_remembers_keys() {
+        let servers = std::env::var("LMOXIDE_TEST_SERVERS").expect("LMOXIDE_TEST_SERVERS");
+        let (a, b) = servers.split_once(',').unwrap();
+        let dir = std::env::temp_dir().join(format!("lmoxide-patcher-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut known = Vec::new();
+        for server in [a, b] {
+            let key = asks(&sync_msgs(server, &dir, None, &known).await).expect("a new key is asked about");
+            assert!(synced(&sync_msgs(server, &dir, Some(key.clone()), &known).await));
+            known.push(key);
+        }
+        for server in [a, b, a] {
+            let msgs = sync_msgs(server, &dir, None, &known).await;
+            assert!(asks(&msgs).is_none() && synced(&msgs), "{server} asked again");
+        }
+        // a key nobody accepted still asks
+        assert!(asks(&sync_msgs(b, &dir, None, &known[..1]).await).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -19,6 +19,9 @@ pub struct Settings {
     pub show_log: bool,
     /// Offer newer builds of this patcher when the server has them.
     pub check_patcher_updates: bool,
+    /// Signing keys (hex) the user trusted, for any server: an install that meets one again,
+    /// e.g. after switching servers, takes it without asking.
+    pub trusted_keys: Vec<String>,
     // The first version's flat settings, moved into the first profile on load (plain fields,
     // not a flattened struct: eframe stores RON, which can't read flattened structs back).
     #[serde(skip_serializing, deserialize_with = "plain")]
@@ -73,6 +76,7 @@ impl Default for Settings {
             jobs: 4,
             show_log: false,
             check_patcher_updates: true,
+            trusted_keys: Vec::new(),
             server: None,
             dir: None,
             platform: None,
@@ -142,6 +146,18 @@ impl Settings {
             }
         }
         self.current = self.current.min(self.profiles.len() - 1);
+    }
+
+    /// Whether the user trusted `key` (hex) before.
+    pub fn key_trusted(&self, key: &str) -> bool {
+        self.trusted_keys.iter().any(|k| k.eq_ignore_ascii_case(key.trim()))
+    }
+
+    /// Remembers that the user trusts `key` (hex).
+    pub fn trust_key(&mut self, key: &str) {
+        if !self.key_trusted(key) {
+            self.trusted_keys.push(key.trim().to_ascii_lowercase());
+        }
     }
 
     pub fn profile(&self) -> &Profile {

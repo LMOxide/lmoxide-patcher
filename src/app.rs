@@ -15,6 +15,8 @@ use std::{
 use eframe::egui::{self, Align, Color32, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
 use lmoxide_patch::{
     Info, Manifest, Platform,
+    client::stored_key,
+    manifest::public_key_hex,
     release::Release,
     sync::{Plan, Progress, Reason},
 };
@@ -237,6 +239,10 @@ impl PatcherApp {
 
     fn location_changed(&mut self) {
         let platform = self.settings.profile().platform;
+        // installs from before the list (or trusted by the CLI) count as the user's choice
+        if let Ok(Some(key)) = stored_key(&self.dir()) {
+            self.settings.trust_key(&public_key_hex(&key));
+        }
         self.installed = worker::installed(&self.dir(), platform);
         self.existing = self.installed.is_none() && self.dir().join(executable_name(platform)).is_file();
         self.info = None;
@@ -271,6 +277,7 @@ impl PatcherApp {
             platform: self.settings.profile().platform,
             jobs: self.settings.jobs,
             trust,
+            trusted_keys: self.settings.trusted_keys.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             patcher_updates: self.settings.check_patcher_updates && self.patcher_updated.is_none(),
             mode: Some(self.settings.profile().mode.trim().to_string()).filter(|m| !m.is_empty()),
@@ -1425,6 +1432,7 @@ impl PatcherApp {
         if let Some(accept) = decision {
             let t = self.trust.take().unwrap();
             if accept {
+                self.settings.trust_key(&t.got);
                 self.start(t.req.job, Some(t.got));
             }
         }
