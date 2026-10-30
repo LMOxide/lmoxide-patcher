@@ -44,7 +44,7 @@ fn plain<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<
 #[serde(default)]
 pub struct Profile {
     pub name: String,
-    /// Patch server URL, e.g. `http://192.168.5.69:8080`.
+    /// Patch server URL, e.g. `http://192.168.1.10:8080`.
     pub server: String,
     /// Install directory.
     pub dir: String,

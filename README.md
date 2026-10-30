@@ -63,7 +63,7 @@ lego-minifigures-online/
 cargo build --release        # → target/release/lmoxide-patcher-gui
 ```
 
-Run it, enter the patch server's address (e.g. `http://192.168.5.69:8080`; `LMOXIDE_SERVER`
+Run it, enter the patch server's address (e.g. `http://192.168.1.10:8080`; `LMOXIDE_SERVER`
 fills it in on first start), and press **Install**.
 
 <details>

@@ -11,7 +11,7 @@ bottom expands into the log.
 
 ## Installing and playing
 
-1. **Patch server** (Installation): the patch server's address, e.g. `http://192.168.5.69:8080`
+1. **Patch server** (Installation): the patch server's address, e.g. `http://192.168.1.10:8080`
    (a bare `host:port` means `http://`). `LMOXIDE_SERVER` fills it in on first start. Press
    Enter or the refresh button: the window shows the server's name, game address, clients on
    offer and any warnings, and whether the install is current. While the server is still
