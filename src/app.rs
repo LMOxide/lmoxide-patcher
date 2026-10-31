@@ -34,6 +34,10 @@ const LOG_LINES: usize = 500;
 const PATCHER_JOB: u64 = u64::MAX;
 /// How often to ask again while the server indexes.
 const RECHECK: Duration = Duration::from_secs(10);
+/// How often an idle window asks whether the server is (still) up.
+const PING_EVERY: Duration = Duration::from_secs(15);
+/// Pings tag their messages from here up (`PatcherApp::ping_id`), below [`PATCHER_JOB`].
+const PING_JOBS: u64 = 1 << 62;
 
 pub struct PatcherApp {
     rt: Runtime,
@@ -53,6 +57,10 @@ pub struct PatcherApp {
     /// The last job's error, shown under the status.
     error: Option<String>,
     recheck_at: Option<Instant>,
+    /// The running ping (`worker::ping`), its message tag and when the next one is due.
+    ping: Option<JoinHandle<()>>,
+    ping_id: u64,
+    ping_at: Instant,
     /// The verified manifest of the current install (for Play).
     installed: Option<Manifest>,
     /// No patcher install, but the client is already in the folder (copied in or set up some
@@ -185,6 +193,9 @@ impl PatcherApp {
             status: None,
             error: None,
             recheck_at: None,
+            ping: None,
+            ping_id: PING_JOBS,
+            ping_at: Instant::now() + PING_EVERY,
             installed: None,
             existing: false,
             password: String::new(),
@@ -250,6 +261,7 @@ impl PatcherApp {
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
+        self.stop_ping();
         if self.settings.profile().server.trim().is_empty() {
             self.cancel();
             self.error = None;
@@ -270,6 +282,7 @@ impl PatcherApp {
         self.run = RunState::default();
         self.error = None;
         self.recheck_at = None;
+        self.ping_at = Instant::now() + PING_EVERY;
         let req = Request {
             job,
             server: self.settings.profile().server.trim().to_string(),
@@ -363,10 +376,74 @@ impl PatcherApp {
                 self.status = Some(Status::UpToDate);
             }
             Msg::Failed(e) => {
+                // a check that fails means the server is down: don't keep showing what it said before
+                if self.busy() == Some(Job::Check) {
+                    self.went_offline();
+                }
                 self.log(Level::Error, e.clone());
                 self.error = Some(e);
             }
             Msg::PickedDir(_) | Msg::Password { .. } | Msg::PasswordStored { .. } => unreachable!("handled in drain"),
+        }
+    }
+
+    /// Asks whether the server is up, every [`PING_EVERY`] while nothing else runs.
+    fn maybe_ping(&mut self) {
+        let due = Instant::now() >= self.ping_at
+            && self.task.is_none()
+            && self.ping.as_ref().is_none_or(|h| h.is_finished())
+            && self.trust.is_none()
+            && !self.settings.profile().server.trim().is_empty();
+        if !due {
+            return;
+        }
+        self.ping_id += 1;
+        self.ping_at = Instant::now() + PING_EVERY;
+        let server = self.settings.profile().server.trim().to_string();
+        self.ping = Some(self.rt.spawn(worker::ping(server, self.out.for_job(self.ping_id))));
+    }
+
+    /// Forgets a running ping (the server or install changed).
+    fn stop_ping(&mut self) {
+        if let Some(h) = self.ping.take() {
+            h.abort();
+        }
+        self.ping_id += 1;
+        self.ping_at = Instant::now() + PING_EVERY;
+    }
+
+    fn ping_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::Info(info) => {
+                // back online, or the server's files changed: check the install again
+                let changed = self
+                    .info
+                    .as_ref()
+                    .is_none_or(|old| old.revisions != info.revisions || old.manifest_key != info.manifest_key);
+                if self.info.is_none() {
+                    self.log(Level::Info, "the server is back online");
+                }
+                self.handle(Msg::Info(info));
+                if changed && self.task.is_none() && self.trust.is_none() {
+                    self.start(Job::Check, None);
+                }
+            }
+            Msg::Game(g) => self.game = Some(g),
+            Msg::Failed(e) if self.info.is_some() => {
+                self.log(Level::Warn, format!("lost the server: {e}"));
+                self.went_offline();
+                self.error.get_or_insert(e);
+            }
+            _ => {}
+        }
+    }
+
+    /// The server stopped answering: show it as offline ("Can't check for updates").
+    fn went_offline(&mut self) {
+        self.info = None;
+        self.game = None;
+        if !matches!(self.status, Some(Status::Indexing)) {
+            self.status = None;
         }
     }
 
@@ -401,6 +478,7 @@ impl PatcherApp {
                 Msg::Password { server, username, result } => self.password_loaded(server, username, result),
                 Msg::PasswordStored { server, username, result } => self.password_stored(server, username, result),
                 msg if id == PATCHER_JOB => self.patcher_msg(msg),
+                msg if id == self.ping_id && self.ping.is_some() => self.ping_msg(msg),
                 msg if id == self.job_id => self.handle(msg),
                 _ => {}
             }
@@ -411,6 +489,7 @@ impl PatcherApp {
         if self.task.is_none() && self.recheck_at.is_some_and(|t| Instant::now() >= t) {
             self.start(Job::Check, None);
         }
+        self.maybe_ping();
     }
 
     fn patcher_msg(&mut self, msg: Msg) {
@@ -700,7 +779,7 @@ impl PatcherApp {
             };
             // Leave room for the chip and the header buttons.
             let pending = self.patcher_pending();
-            let buttons = if pending.is_some() { 208.0 } else { 170.0 };
+            let buttons = if pending.is_some() { 246.0 } else { 208.0 };
             let room = (ui.available_width() - buttons).max(40.0);
             let line = |text: String, font: egui::FontId, color: Color32| {
                 let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
@@ -726,6 +805,13 @@ impl PatcherApp {
                     if resp.clicked() {
                         self.patcher_banner_hidden = false;
                         self.reveal_patcher_banner = true;
+                    }
+                }
+                if !self.settings.profile().server.trim().is_empty() {
+                    ui.add_space(4.0);
+                    let tip = if self.working() { "Check the server (after this finishes)" } else { "Check the server now" };
+                    if theme::icon_button(ui, icon::UPDATE, tip).clicked() && !self.working() {
+                        self.start(Job::Check, None);
                     }
                 }
                 ui.add_space(4.0);
@@ -1445,8 +1531,9 @@ impl eframe::App for PatcherApp {
         if self.working() {
             // Keep the rate and ETA moving between progress messages.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
-        } else if let Some(t) = self.recheck_at {
-            ui.ctx().request_repaint_after(t.saturating_duration_since(Instant::now()));
+        } else {
+            let next = self.recheck_at.map_or(self.ping_at, |t| t.min(self.ping_at));
+            ui.ctx().request_repaint_after(next.saturating_duration_since(Instant::now()));
         }
 
         egui::Panel::top("header").frame(egui::Frame::NONE).exact_size(84.0).show(ui, |ui| self.header_ui(ui));

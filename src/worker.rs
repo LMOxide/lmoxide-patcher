@@ -274,6 +274,22 @@ pub async fn install_patcher(server: String, release: Release, exe: PathBuf, out
     }
 }
 
+/// Whether the server is up: its info and the game server's status, nothing about the install
+/// (the window's periodic refresh).
+pub async fn ping(server: String, out: Outbox) {
+    let info = async { Client::new(&server)?.info().await }.await;
+    match info {
+        Ok(info) => {
+            let api = info.api_url.clone();
+            out.send(Msg::Info(info));
+            if let Some(api) = api {
+                out.send(Msg::Game(game_status(&api).await));
+            }
+        }
+        Err(e) => out.send(Msg::Failed(e.to_string())),
+    }
+}
+
 /// Asks the server's API about the game server (best effort: errors leave fields empty).
 async fn game_status(api: &str) -> GameStatus {
     let base = api.trim_end_matches('/');
