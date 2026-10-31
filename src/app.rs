@@ -51,6 +51,8 @@ pub struct PatcherApp {
     info: Option<Info>,
     /// The game server, from the server's API (`Info::api_url`).
     game: Option<GameStatus>,
+    /// When the server last answered a check or ping, or failed to (under the header's chip).
+    checked_at: Option<Instant>,
     /// Server warnings already logged.
     warned: Vec<String>,
     status: Option<Status>,
@@ -189,6 +191,7 @@ impl PatcherApp {
             run: RunState::default(),
             info: None,
             game: None,
+            checked_at: None,
             warned: Vec::new(),
             status: None,
             error: None,
@@ -258,6 +261,7 @@ impl PatcherApp {
         self.existing = self.installed.is_none() && self.dir().join(executable_name(platform)).is_file();
         self.info = None;
         self.game = None;
+        self.checked_at = None;
         self.status = None;
         self.verified = None;
         self.dir_edited = false;
@@ -320,6 +324,7 @@ impl PatcherApp {
                     self.warned.push(w);
                 }
                 self.info = Some(info);
+                self.checked_at = Some(Instant::now());
             }
             Msg::Game(g) => self.game = Some(g),
             Msg::PatcherUpdate(r) => {
@@ -434,12 +439,15 @@ impl PatcherApp {
                 self.went_offline();
                 self.error.get_or_insert(e);
             }
+            // still down: it was checked all the same
+            Msg::Failed(_) => self.checked_at = Some(Instant::now()),
             _ => {}
         }
     }
 
     /// The server stopped answering: show it as offline ("Can't check for updates").
     fn went_offline(&mut self) {
+        self.checked_at = Some(Instant::now());
         self.info = None;
         self.game = None;
         if !matches!(self.status, Some(Status::Indexing)) {
@@ -753,6 +761,24 @@ impl PatcherApp {
         }
     }
 
+    /// The lines under the connection chip: players online and how long ago the server was checked.
+    fn connection_caption(&self) -> Vec<String> {
+        let Some(at) = self.checked_at else { return Vec::new() };
+        let checked = format!("checked {}", ago(at.elapsed().as_secs()));
+        let players = self
+            .info
+            .as_ref()
+            .and(self.game.as_ref())
+            .and_then(|g| g.status.as_ref())
+            .filter(|s| s.game_server_online)
+            .and_then(|s| s.players_online);
+        match players {
+            Some(1) => vec!["1 player online".into(), checked],
+            Some(n) => vec![format!("{n} players online"), checked],
+            None => vec![checked],
+        }
+    }
+
     fn header_ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         let painter = ui.painter();
@@ -779,7 +805,16 @@ impl PatcherApp {
             };
             // Leave room for the chip and the header buttons.
             let pending = self.patcher_pending();
-            let buttons = if pending.is_some() { 246.0 } else { 208.0 };
+            let (color, chip_text) = self.connection();
+            let caption: Vec<_> = self
+                .connection_caption()
+                .into_iter()
+                .map(|text| ui.painter().layout_no_wrap(text, egui::FontId::proportional(11.5), Color32::from_rgb(0xa9, 0xb6, 0xd8)))
+                .collect();
+            // the caption can be wider than the chip (`theme::chip` is its text + 32)
+            let chip_w = ui.painter().layout_no_wrap(chip_text.into(), egui::FontId::new(12.5, theme::semibold()), theme::TEXT).size().x + 32.0;
+            let extra = caption.iter().map(|c| (c.size().x - chip_w).max(0.0)).fold(0.0, f32::max);
+            let buttons = if pending.is_some() { 246.0 } else { 208.0 } + extra;
             let room = (ui.available_width() - buttons).max(40.0);
             let line = |text: String, font: egui::FontId, color: Color32| {
                 let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
@@ -815,10 +850,20 @@ impl PatcherApp {
                     }
                 }
                 ui.add_space(4.0);
-                let (color, text) = self.connection();
-                let chip = theme::chip(ui, color, text);
+                // the chip, with when the server was last checked and who's playing under it
+                let caption_h: f32 = caption.iter().map(|c| c.size().y).sum::<f32>() + if caption.is_empty() { 0.0 } else { 2.0 };
+                let width = chip_w + extra;
+                let (block, _) = ui.allocate_exact_size(vec2(width, 26.0 + caption_h), Sense::hover());
+                let chip_rect = Rect::from_min_size(pos2(block.right() - chip_w, block.top()), vec2(chip_w, 26.0));
+                let chip = ui.scope_builder(egui::UiBuilder::new().max_rect(chip_rect), |ui| theme::chip(ui, color, chip_text)).inner;
                 if let Some(e) = self.error.as_deref().filter(|_| self.info.is_none()) {
                     chip.on_hover_text(e);
+                }
+                let mut y = block.top() + 28.0;
+                for c in caption {
+                    let h = c.size().y;
+                    ui.painter().galley(pos2(block.right() - c.size().x, y), c, theme::TEXT);
+                    y += h;
                 }
             });
         });
@@ -942,7 +987,9 @@ impl PatcherApp {
             stat(ui, "Files", format!("{} / {}", r.files_done, r.files_total));
         });
         ui.spacing_mut().item_spacing.y = 2.0;
-        for p in r.current.iter().take(3) {
+        // Always three rows, so files starting and finishing don't move what's below.
+        for i in 0..3 {
+            let p = r.current.get(i).map_or(" ", String::as_str);
             ui.add(egui::Label::new(RichText::new(p).monospace().size(11.5).color(theme::WEAK)).truncate());
         }
     }
@@ -1533,7 +1580,9 @@ impl eframe::App for PatcherApp {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         } else {
             let next = self.recheck_at.map_or(self.ping_at, |t| t.min(self.ping_at));
-            ui.ctx().request_repaint_after(next.saturating_duration_since(Instant::now()));
+            // and once a second for the "checked … ago" under the chip
+            let wait = next.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+            ui.ctx().request_repaint_after(wait);
         }
 
         egui::Panel::top("header").frame(egui::Frame::NONE).exact_size(84.0).show(ui, |ui| self.header_ui(ui));
@@ -1671,6 +1720,18 @@ fn human_bytes(n: u64) -> String {
         unit += 1;
     }
     format!("{v:.1} {}", UNITS[unit])
+}
+
+/// "just now", "40 s ago", "5 min ago", "2 h ago", "3 days ago".
+fn ago(secs: u64) -> String {
+    match secs {
+        0..5 => "just now".into(),
+        5..60 => format!("{secs} s ago"),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        86400..172800 => "1 day ago".into(),
+        _ => format!("{} days ago", secs / 86400),
+    }
 }
 
 fn human_duration(secs: f64) -> String {
